@@ -1,0 +1,197 @@
+/*
+
+This CSS file will be included with your plugin, and
+available in the app when your plugin is enabled.
+
+If your plugin does not need CSS, delete this file.
+
+*/
+
+/* AI Transcriber Record Modal Styles */
+.ai-transcriber-record-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  align-items: stretch;
+  min-width: 320px;
+}
+
+.ai-transcriber-record-modal .record-header {
+  text-align: center;
+}
+
+.ai-transcriber-record-modal .record-header h2 {
+  margin: 0;
+  font-size: 1.5em;
+  font-weight: 700;
+}
+
+.ai-transcriber-record-modal .record-subtitle {
+  margin-top: 4px;
+  font-size: 0.95em;
+  color: var(--text-muted);
+}
+
+.ai-transcriber-record-modal .record-card {
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: var(--shadow-s, 0 2px 8px rgba(0, 0, 0, 0.12));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ai-transcriber-record-modal .recorder-timer {
+  font-size: 2.7em;
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: linear-gradient(180deg, var(--background-secondary), var(--background-secondary-alt));
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-normal);
+}
+
+.ai-transcriber-record-modal .audio-waveform-wrap {
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: inset 0 0 0 1px var(--background-modifier-border-hover);
+}
+
+/* 音频波形显示样式 */
+.ai-transcriber-record-modal .audio-waveform {
+  width: 100%;
+  height: 110px;
+  border-radius: 8px;
+  display: block;
+  background: transparent;
+}
+
+.ai-transcriber-record-modal .recorder-actions {
+  display: flex;
+  justify-content: center;
+}
+
+.ai-transcriber-record-modal .recorder-button-container {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.ai-transcriber-record-modal .recorder-button-container button {
+  padding: 7px 12px;
+  min-width: 96px;
+  height: 36px;
+  font-size: 0.95em;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background-color: var(--background-primary-alt);
+  color: var(--text-normal);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease-in-out, border-color 0.15s ease-in-out, transform 0.08s ease-in-out, box-shadow 0.15s ease-in-out;
+}
+
+.ai-transcriber-record-modal .recorder-button-container button:hover:not([disabled]) {
+  background-color: var(--background-modifier-hover);
+  border-color: var(--background-modifier-border-hover);
+}
+
+.ai-transcriber-record-modal .recorder-button-container button:active:not([disabled]) {
+  transform: translateY(1px) scale(0.98);
+  background-color: var(--background-modifier-active);
+  border-color: var(--interactive-accent-hover);
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+
+.ai-transcriber-record-modal .recorder-button-container button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Style for the primary action button (Record) */
+.ai-transcriber-record-modal .recorder-button-container button.mod-cta {
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent-hover);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+}
+
+.ai-transcriber-record-modal .recorder-button-container button.mod-cta:hover:not([disabled]) {
+  background-color: var(--interactive-accent-hover);
+}
+
+.ai-transcriber-record-modal .recorder-button-container button:focus-visible:not([disabled]) {
+  outline: 2px solid var(--interactive-accent-hover);
+  outline-offset: 2px;
+}
+
+.ai-transcriber-record-modal .recorder-btn-record {
+  min-width: 112px;
+  height: 38px;
+  font-size: 1em;
+}
+
+/* Recording / paused visual states */
+.ai-transcriber-record-modal.is-recording .recorder-timer {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent-hover);
+}
+
+.ai-transcriber-record-modal.is-recording .audio-waveform-wrap {
+  border-color: var(--interactive-accent-hover);
+}
+
+.ai-transcriber-record-modal.is-recording .recorder-btn-record {
+  position: relative;
+}
+
+.ai-transcriber-record-modal.is-recording .recorder-btn-record::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: inherit;
+  border: 2px solid var(--interactive-accent);
+  opacity: 0.35;
+  animation: ai-transcriber-ring 1.6s ease-out infinite;
+  pointer-events: none;
+}
+
+.ai-transcriber-record-modal.is-paused .recorder-timer {
+  opacity: 0.7;
+}
+
+@keyframes ai-transcriber-ring {
+  0% { transform: scale(1); opacity: 0.4; }
+  100% { transform: scale(1.2); opacity: 0; }
+}
+
+/* Make all setting controls wider and of equal width */
+.ai-transcriber-settings .setting-item-control {
+    flex: 0 0 400px !important;
+    max-width: 400px !important;
+}
+
+/* Ensure text inputs and textareas fill the control width */
+.ai-transcriber-settings .setting-item-control input[type="text"],
+.ai-transcriber-settings .setting-item-control textarea {
+    width: 100% !important;
+    box-sizing: border-box; /* Good practice for width calculation */
+}
+
+/* Prevent manual resizing of textareas */
+.ai-transcriber-settings .setting-item-control textarea {
+    resize: none !important;
+}
