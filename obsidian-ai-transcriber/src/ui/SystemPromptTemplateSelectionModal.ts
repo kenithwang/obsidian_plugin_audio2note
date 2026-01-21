@@ -1,16 +1,29 @@
 import { App, Modal, Setting } from 'obsidian';
 import ObsidianAITranscriber from '../../main';
+import { Participant } from '../settings/types';
+import ParticipantModal from './ParticipantModal';
+
+export interface TemplateSelectionResult {
+	name: string;
+	context: string;
+	participants: Participant[];
+	purpose: string;
+}
 
 export class SystemPromptTemplateSelectionModal extends Modal {
 	plugin: ObsidianAITranscriber;
-	onSubmit: (selectedTemplateName: string | null) => void;
+	onSubmit: (selection: TemplateSelectionResult | null) => void;
 	private selectedName: string;
+	private selectedParticipantIds: Set<string>;
+	private meetingPurpose: string;
 
-	constructor(app: App, plugin: ObsidianAITranscriber, onSubmit: (selectedTemplateName: string | null) => void) {
+	constructor(app: App, plugin: ObsidianAITranscriber, onSubmit: (selection: TemplateSelectionResult | null) => void) {
 		super(app);
 		this.plugin = plugin;
 		this.onSubmit = onSubmit;
 		this.selectedName = plugin.settings.editor.activeSystemPromptTemplateName; // Default to current active
+		this.selectedParticipantIds = new Set<string>();
+		this.meetingPurpose = '';
 	}
 
 	onOpen() {
@@ -20,6 +33,9 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 		contentEl.createEl('h2', { text: 'Select System Prompt Template' });
 
 		const templates = this.plugin.settings.editor.systemPromptTemplates;
+		if (!this.plugin.settings.editor.participants) {
+			this.plugin.settings.editor.participants = [];
+		}
 		if (!templates || templates.length === 0) {
 			// Should not happen if 'Default' template is always ensured
 			contentEl.createEl('p', { text: 'No system prompt templates found. Please create one in settings.' });
@@ -49,6 +65,97 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 			});
 
 		new Setting(contentEl)
+			.setName('参会人员')
+			.setDesc('选择参会人员，或新增人物。')
+			.addButton(btn =>
+				btn
+					.setButtonText('新增人物')
+					.setCta()
+					.onClick(() => {
+						new ParticipantModal(this.app, this.plugin, participant => {
+							if (!participant) return;
+							this.plugin.settings.editor.participants.push(participant);
+							this.plugin.saveSettings().then(() => this.onOpen());
+						}).open();
+					})
+			);
+
+		if (this.plugin.settings.editor.participants.length === 0) {
+			contentEl.createEl('div', { text: '暂无参会人员，请先新增。' });
+		} else {
+			this.plugin.settings.editor.participants.forEach(participant => {
+				new Setting(contentEl)
+					.setName(
+						participant.name + (participant.org ? ` (${participant.org})` : '')
+					)
+					.setDesc(participant.intro || '')
+					.addToggle(toggle => {
+						toggle.setValue(this.selectedParticipantIds.has(participant.id));
+						toggle.onChange(value => {
+							if (value) {
+								this.selectedParticipantIds.add(participant.id);
+							} else {
+								this.selectedParticipantIds.delete(participant.id);
+							}
+						});
+					})
+					.addButton(btn =>
+						btn.setButtonText('编辑').onClick(() => {
+							new ParticipantModal(this.app, this.plugin, updated => {
+								if (!updated) return;
+								const idx = this.plugin.settings.editor.participants.findIndex(
+									p => p.id === participant.id
+								);
+								if (idx >= 0) {
+									this.plugin.settings.editor.participants[idx] = updated;
+									this.plugin.saveSettings().then(() => this.onOpen());
+								}
+							}, participant).open();
+						})
+					)
+					.addButton(btn =>
+						btn.setButtonText('删除').setWarning().onClick(() => {
+							const modal = new Modal(this.app);
+							modal.contentEl.createEl('h2', { text: '确认删除' });
+							modal.contentEl.createEl('p', { text: `确定要删除 "${participant.name}" 吗？` });
+							new Setting(modal.contentEl)
+								.addButton(cancel =>
+									cancel.setButtonText('取消').onClick(() => modal.close())
+								)
+								.addButton(confirm =>
+									confirm
+										.setButtonText('删除')
+										.setWarning()
+										.onClick(() => {
+											this.selectedParticipantIds.delete(participant.id);
+											this.plugin.settings.editor.participants =
+												this.plugin.settings.editor.participants.filter(p => p.id !== participant.id);
+											this.plugin.saveSettings().then(() => {
+												modal.close();
+												this.onOpen();
+											});
+										})
+								);
+							modal.open();
+						})
+					);
+			});
+		}
+
+		new Setting(contentEl)
+			.setName('参会目的（可选）')
+			.setDesc('简要说明本次会议目的/背景。')
+			.addTextArea(text => {
+				text.setPlaceholder('可选，简要描述...');
+				text.setValue(this.meetingPurpose);
+				text.onChange(value => {
+					this.meetingPurpose = value;
+				});
+				text.inputEl.rows = 3;
+				text.inputEl.style.width = '100%';
+			});
+
+		new Setting(contentEl)
 			.addButton(btn =>
 				btn.setButtonText('Cancel').onClick(() => {
 					this.onSubmit(null);
@@ -60,7 +167,29 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 					.setButtonText('Confirm')
 					.setCta()
 					.onClick(() => {
-						this.onSubmit(this.selectedName);
+						let context = '';
+						const selectedParticipants = this.plugin.settings.editor.participants.filter(p =>
+							this.selectedParticipantIds.has(p.id)
+						);
+						if (selectedParticipants.length) {
+							context +=
+								'参会人员：\n' +
+								selectedParticipants
+									.map(
+										p =>
+											`- ${p.name}${p.org ? ` (${p.org})` : ''}${p.intro ? ` — ${p.intro}` : ''}`
+									)
+									.join('\n');
+						}
+						if (this.meetingPurpose && this.meetingPurpose.trim()) {
+							context += `${context ? '\n\n' : ''}会议目的：\n${this.meetingPurpose.trim()}`;
+						}
+						this.onSubmit({
+							name: this.selectedName,
+							context,
+							participants: selectedParticipants,
+							purpose: this.meetingPurpose,
+						});
 						this.close();
 					})
 			);
@@ -70,4 +199,4 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 	}
-} 
+}

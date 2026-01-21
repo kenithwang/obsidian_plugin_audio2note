@@ -7,7 +7,12 @@ export class EditorService {
 	 * @param settings EditorSettings from plugin configuration
 	 * @param systemPromptOverride Optional: A specific system prompt to use for this edit, overriding settings.
 	 */
-	async edit(text: string, settings: EditorSettings, systemPromptOverride?: string): Promise<string> {
+	async edit(
+		text: string,
+		settings: EditorSettings,
+		systemPromptOverride?: string,
+		context?: string
+	): Promise<string> {
 		if (!settings.apiKey) {
 			throw new Error('Editor API key is not configured');
 		}
@@ -36,10 +41,20 @@ export class EditorService {
 		if (systemPromptToUse) {
 			messages.push({ role: 'system', content: systemPromptToUse });
 		}
-		// Combine user prompt and transcript text
-		const content = settings.userPrompt
-			? `${settings.userPrompt}\n\n${text}`
-			: text;
+		// Combine user prompt, meeting context, and transcript text
+		let content = settings.userPrompt ? `${settings.userPrompt}\n\n` : '';
+		if (context && context.trim()) {
+			content += `【用户提供的会议背景（可选）】
+${context.trim()}
+【使用规则】
+- 用于帮助理解上下文
+- 若与逐字稿不一致，以逐字稿为准
+- 不得凭背景补充逐字稿未出现的事实
+
+`;
+		}
+		content += `【逐字稿】
+${text}`;
 		messages.push({ role: 'user', content });
 
 		// Handle OpenAI provider
@@ -128,7 +143,12 @@ export class EditorService {
 	 * This ensures the transcript doesn't get cut off due to token limits,
 	 * as it has its own dedicated API call.
 	 */
-	async editWithTwoStage(text: string, settings: EditorSettings, systemPromptOverride?: string): Promise<string> {
+	async editWithTwoStage(
+		text: string,
+		settings: EditorSettings,
+		systemPromptOverride?: string,
+		context?: string
+	): Promise<string> {
 		if (!settings.apiKey) {
 			throw new Error('Editor API key is not configured');
 		}
@@ -158,7 +178,12 @@ export class EditorService {
 
 		// ===== Stage 1: Generate Summary Sections =====
 		console.info('[AI Transcriber Editor] Stage 1: Generating summary/analysis sections...');
-		const summaryPrompt = this.prepareSummaryPrompt(systemPromptToUse, settings.userPrompt || '', rawTranscript);
+		const summaryPrompt = this.prepareSummaryPrompt(
+			systemPromptToUse,
+			settings.userPrompt || '',
+			rawTranscript,
+			context
+		);
 		const summaryPart = await this.generateContent(summaryPrompt, settings, 0.2);
 		console.info('[AI Transcriber Editor] Stage 1 complete, length:', summaryPart.length);
 
@@ -197,19 +222,32 @@ export class EditorService {
 	/**
 	 * Prepare prompt for Stage 1 (summary generation only, no transcript output)
 	 */
-	private prepareSummaryPrompt(systemPrompt: string, userPrompt: string, transcript: string): string {
+	private prepareSummaryPrompt(
+		systemPrompt: string,
+		userPrompt: string,
+		transcript: string,
+		context?: string
+	): string {
 		// Remove the "完整逐字稿" section from the prompt
 		let summaryTemplate = systemPrompt.replace(/###\s*\d+\.\s*完整逐字稿.*$/s, '');
+
+		if (context && context.trim()) {
+			userPrompt += `
+
+【用户提供的会议背景（可选）】
+${context.trim()}
+【使用规则】
+- 用于帮助理解上下文
+- 若与逐字稿不一致，以逐字稿为准
+- 不得凭背景补充逐字稿未出现的事实`;
+		}
 
 		// Add explicit instruction to not output transcript
 		summaryTemplate += '\n\n**重要提示**: 只生成前面的分析部分（Section 1-5或类似结构），不要输出完整逐字稿部分。';
 
-		// Combine with user prompt and transcript
-		const fullPrompt = userPrompt
-			? `${summaryTemplate}\n\n${userPrompt}\n\n---\n\n${transcript}`
-			: `${summaryTemplate}\n\n---\n\n${transcript}`;
-
-		return fullPrompt;
+		return userPrompt
+			? `${summaryTemplate}\n\n${userPrompt}\n\n【逐字稿】\n${transcript}`
+			: `${summaryTemplate}\n\n【逐字稿】\n${transcript}`;
 	}
 
 	/**

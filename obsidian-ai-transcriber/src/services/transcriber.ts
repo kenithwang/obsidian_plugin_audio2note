@@ -6,7 +6,11 @@ export class TranscriberService {
 	 * @param blob Audio blob to transcribe
 	 * @param settings TranscriberSettings from plugin configuration
 	 */
-	async transcribe(blob: Blob, settings: import('../settings/types').TranscriberSettings): Promise<string> {
+	async transcribe(
+		blob: Blob,
+		settings: import('../settings/types').TranscriberSettings,
+		context?: string
+	): Promise<string> {
 		if (!settings.apiKey) {
 			throw new Error('Transcriber API key is not configured');
 		}
@@ -29,11 +33,19 @@ export class TranscriberService {
 			for (const chunk of chunks) {
 				idx++;
 				console.info(`[AI Transcriber] OpenAI transcribing chunk ${idx}/${chunks.length}...`, { sizeBytes: chunk.size });
+				let prompt = settings.prompt || '';
+				if (context && context.trim()) {
+					const contextBlock =
+						'【用户提供的会议背景（仅用于提高识别准确性）】\n' +
+						context.trim() +
+						'\n【使用规则】\n- 仅用于人名/组织/术语识别\n- 不要添加音频中未出现的内容';
+					prompt = prompt ? `${prompt}\n\n${contextBlock}` : contextBlock;
+				}
 				const transcription = await openai.audio.transcriptions.create({
 					file: new File([chunk], 'audio.wav', { type: 'audio/wav' }),
 					model: settings.model,
 					response_format: 'text',
-					...(settings.prompt ? { prompt: settings.prompt } : {}),
+					...(prompt ? { prompt } : {}),
 				});
 				if (fullText) fullText += '\n';
 				fullText += transcription;
@@ -51,10 +63,10 @@ export class TranscriberService {
 			// Prefer uploading the original (already compressed) audio when possible.
 			// Fall back to preprocessing/chunking only for very large files.
 			const MAX_UPLOAD_BYTES = 90 * 1024 * 1024; // Keep below 100MB File API limit
-			const MAX_DURATION_SECONDS = 8 * 60 * 60; // 8 小时（用于预处理分块）
+			const MAX_DURATION_SECONDS = 15 * 60; // 15 分钟，降低漏转风险
 			const preferQualityWav = settings.preferQualityWav;
-			const useDirectUpload = !preferQualityWav && blob.size <= MAX_UPLOAD_BYTES;
-			console.info('[AI Transcriber] Gemini path selected.', {
+			const useDirectUpload = false;
+			console.info('[AI Transcriber] Gemini path selected (direct upload disabled).', {
 				useDirectUpload,
 				preferQualityWav,
 				thresholdBytes: MAX_UPLOAD_BYTES,
@@ -102,7 +114,7 @@ export class TranscriberService {
 				console.info(`[AI Transcriber] Gemini generating content for chunk ${idx}/${chunks.length}...`);
 
 				// Enhanced prompt to emphasize completeness
-				const enhancedPrompt = settings.prompt ||
+				let enhancedPrompt = settings.prompt ||
 					'You are a professional multilingual transcriber. Your task is to transcribe the audio file VERBATIM (word-for-word) into text.\n\n' +
 					'**CRITICAL REQUIREMENTS:**\n' +
 					'- **TRANSCRIBE THE ENTIRE AUDIO FROM START TO FINISH.** Do NOT skip, truncate, or omit any part.\n' +
@@ -118,6 +130,12 @@ export class TranscriberService {
 					'4. **Format:** Output plain text with clear paragraph breaks.\n' +
 					'5. **Noise:** Ignore non-speech sounds (like [laughter], [silence], [typing sounds]).\n\n' +
 					'Begin transcription now and continue until the audio ends.';
+				if (context && context.trim()) {
+					enhancedPrompt +=
+						'\n\n【用户提供的会议背景（仅用于提高识别准确性）】\n' +
+						context.trim() +
+						'\n【使用规则】\n- 仅用于人名/组织/术语识别\n- 不要添加音频中未出现的内容';
+				}
 
 				const response = await genAI.models.generateContent({
 					model: settings.model,
@@ -159,15 +177,13 @@ export class TranscriberService {
 	}
 
 	/**
-	 * Gemini 专用预处理：重采样、去静音，超过 maxDurationSeconds 则分块。
+	 * Gemini 专用预处理：重采样，不做静音裁剪，仅在静音处切分，超过 maxDurationSeconds 则分块。
 	 * 仅在原始音频过大时使用此路径。
 	 */
 	private async preprocessForGemini(blob: Blob, maxDurationSeconds: number): Promise<Blob[]> {
 		console.info('[AI Transcriber] Gemini preprocess (WAV chunking) start.', { maxDurationSeconds, sizeBytes: blob.size });
 		const TARGET_SAMPLE_RATE = 16000;
 		const SILENCE_THRESHOLD = 0.01;
-		const MIN_SILENCE_DURATION_SECONDS = 2;
-		const MIN_SILENCE_TRIM_SAMPLES = Math.floor(MIN_SILENCE_DURATION_SECONDS * TARGET_SAMPLE_RATE);
 		const CHUNK_SPLIT_SILENCE_WINDOW_SECONDS = 0.3;
 		const CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES = Math.floor(CHUNK_SPLIT_SILENCE_WINDOW_SECONDS * TARGET_SAMPLE_RATE);
 		const CHUNK_SPLIT_SEARCH_RANGE_SECONDS = 5;
@@ -210,38 +226,8 @@ export class TranscriberService {
 		source.start();
 		const resampled = await offlineCtx.startRendering();
 
-		// 静音裁剪
-		const rawData = resampled.getChannelData(0);
-		let samplesToKeep = 0;
-		let currentSilentCount = 0;
-		for (let i = 0; i < rawData.length; i++) {
-			if (Math.abs(rawData[i]) <= SILENCE_THRESHOLD) {
-				currentSilentCount++;
-			} else {
-				if (currentSilentCount > 0 && currentSilentCount < MIN_SILENCE_TRIM_SAMPLES) {
-					samplesToKeep += currentSilentCount;
-				}
-				currentSilentCount = 0;
-				samplesToKeep++;
-			}
-		}
-
-		const data = new Float32Array(samplesToKeep);
-		let currentIndex = 0;
-		currentSilentCount = 0;
-		for (let i = 0; i < rawData.length; i++) {
-			if (Math.abs(rawData[i]) <= SILENCE_THRESHOLD) {
-				currentSilentCount++;
-			} else {
-				if (currentSilentCount > 0 && currentSilentCount < MIN_SILENCE_TRIM_SAMPLES) {
-					for (let j = i - currentSilentCount; j < i; j++) {
-						data[currentIndex++] = rawData[j];
-					}
-				}
-				currentSilentCount = 0;
-				data[currentIndex++] = rawData[i];
-			}
-		}
+		// 不做静音裁剪，保留全部内容，仅用于后续静音处切分
+		const data = resampled.getChannelData(0);
 
 		// 分块逻辑（如果超过 maxDurationSeconds）
 		const maxSamples = maxDurationSeconds * TARGET_SAMPLE_RATE;

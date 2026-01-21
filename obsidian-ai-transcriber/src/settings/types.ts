@@ -18,11 +18,19 @@ export interface SystemPromptTemplate {
 	prompt: string;
 }
 
+export interface Participant {
+	id: string;
+	name: string;
+	org: string;
+	intro: string;
+}
+
 export interface EditorSettings {
 	enabled: boolean;
 	provider: 'openai' | 'gemini';
 	apiKey: string;
 	model: string;
+	participants: Participant[];
 	systemPromptTemplates: SystemPromptTemplate[];
 	activeSystemPromptTemplateName: string;
 	userPrompt: string;
@@ -51,6 +59,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 		provider: 'gemini',
 		apiKey: '',
 		model: 'gemini-2.5-pro-preview-06-05',
+		participants: [],
 		systemPromptTemplates: [
 			{
 				name: 'Default',

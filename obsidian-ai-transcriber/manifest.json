@@ -1,9 +1,9 @@
 {
 	"id": "obsidian-ai-transcriber",
 	"name": "Obsidian AI Transcriber",
-	"version": "2.0.0",
+	"version": "2.0.1",
 	"minAppVersion": "1.8.0",
-	"description": "Professional AI-powered audio transcription with two-stage generation for complete, accurate transcripts and structured notes",
+	"description": "Professional AI-powered audio transcription with two-stage generation, meeting context/participants, and structured notes",
 	"author": "kenithwang",
 	"authorUrl": "https://github.com/Tav607",
 	"fundingUrl": "",

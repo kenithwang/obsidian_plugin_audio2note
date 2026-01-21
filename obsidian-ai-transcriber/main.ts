@@ -70,7 +70,10 @@ export default class ObsidianAITranscriber extends Plugin {
 				}
 
 				// Show template selection modal
-				new SystemPromptTemplateSelectionModal(this.app, this, async (selectedTemplateName) => {
+				new SystemPromptTemplateSelectionModal(this.app, this, async (selection) => {
+					const selectedTemplateName =
+						typeof selection === 'object' && selection ? selection.name : selection;
+					const context = typeof selection === 'object' && selection ? selection.context : '';
 					if (!selectedTemplateName) {
 						new Notice('Template selection cancelled. Editing aborted.');
 						return;
@@ -87,7 +90,12 @@ export default class ObsidianAITranscriber extends Plugin {
 
 					try {
 						// Use two-stage editing to prevent transcript truncation
-						const editedText = await this.editorService.editWithTwoStage(originalText, this.settings.editor, selectedTemplate.prompt);
+						const editedText = await this.editorService.editWithTwoStage(
+							originalText,
+							this.settings.editor,
+							selectedTemplate.prompt,
+							context
+						);
 						const dir = file.parent ? file.parent.path : this.settings.transcriber.transcriptDir;
 						const baseName = file.basename.replace(/_raw_transcript$/, '').replace(/_edited_transcript$/, '');
 						
@@ -117,7 +125,7 @@ export default class ObsidianAITranscriber extends Plugin {
 						item.setTitle('Transcribe with AI')
 							.setIcon('microphone')
 							.onClick(async () => {
-								const processAudioFile = async (systemPromptOverride?: string) => {
+								const processAudioFile = async (systemPromptOverride?: string, context?: string) => {
 									this.updateStatus('AI Transcribing...');
 									new Notice('Transcribing audio…');
 									try {
@@ -127,7 +135,7 @@ export default class ObsidianAITranscriber extends Plugin {
 										else if (file.extension === 'webm') mime = 'audio/webm';
 										else if (file.extension === 'mp3') mime = 'audio/mpeg';
 										const blob = new Blob([arrayBuffer], { type: mime });
-										const transcript = await this.transcriber.transcribe(blob, this.settings.transcriber);
+										const transcript = await this.transcriber.transcribe(blob, this.settings.transcriber, context);
 										const dir = this.settings.transcriber.transcriptDir;
 										const audioFileName = file.name;
 										const baseName = audioFileName.replace(/\.[^/.]+$/, '');
@@ -141,7 +149,12 @@ export default class ObsidianAITranscriber extends Plugin {
 											}
 											new Notice('Editing transcript with AI using the selected template.'); // User already saw template name
 											// Use two-stage editing to prevent transcript truncation
-											const edited = await this.editorService.editWithTwoStage(transcript, this.settings.editor, systemPromptOverride);
+											const edited = await this.editorService.editWithTwoStage(
+												transcript,
+												this.settings.editor,
+												systemPromptOverride,
+												context
+											);
 											const editedFileName = `${baseName}_edited_transcript.md`;
 											const editedPath = await this.fileService.saveTextWithName(edited, dir, editedFileName);
 											new Notice(`Edited transcript saved to ${editedPath}`);
@@ -162,7 +175,11 @@ export default class ObsidianAITranscriber extends Plugin {
 								};
 
 								if (this.settings.editor.enabled) {
-									new SystemPromptTemplateSelectionModal(this.app, this, async (selectedTemplateName) => {
+									new SystemPromptTemplateSelectionModal(this.app, this, async (selection) => {
+										const selectedTemplateName =
+											typeof selection === 'object' && selection ? selection.name : selection;
+										const context =
+											typeof selection === 'object' && selection ? selection.context : '';
 										if (!selectedTemplateName) {
 											new Notice('Template selection cancelled. Transcription aborted.');
 											this.updateStatus('Transcriber Idle'); // Reset status
@@ -174,7 +191,7 @@ export default class ObsidianAITranscriber extends Plugin {
 											this.updateStatus('Transcriber Idle'); // Reset status
 											return;
 										}
-										await processAudioFile(selectedTemplate.prompt);
+										await processAudioFile(selectedTemplate.prompt, context);
 									}).open();
 								} else {
 									// Editor not enabled, proceed directly with transcription and saving raw.

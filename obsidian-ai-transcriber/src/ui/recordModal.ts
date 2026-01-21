@@ -127,7 +127,10 @@ export default class RecordModal extends Modal {
 				const transcriptDir = this.plugin.settings.transcriber.transcriptDir;
 
 				if (this.plugin.settings.editor.enabled) {
-					new SystemPromptTemplateSelectionModal(this.app, this.plugin, async (selectedTemplateName) => {
+					new SystemPromptTemplateSelectionModal(this.app, this.plugin, async (selection) => {
+						const selectedTemplateName =
+							typeof selection === 'object' && selection ? selection.name : selection;
+						const context = typeof selection === 'object' && selection ? selection.context : '';
 						if (!selectedTemplateName) {
 							new Notice('Template selection cancelled. Audio saved, transcription aborted.');
 							this.plugin.updateStatus('Transcriber Idle');
@@ -147,7 +150,11 @@ export default class RecordModal extends Modal {
 							try {
 								this.plugin.updateStatus('AI Transcribing...');
 								new Notice('Transcribing audio…');
-								const transcript = await this.plugin.transcriber.transcribe(result.blob, this.plugin.settings.transcriber);
+								const transcript = await this.plugin.transcriber.transcribe(
+									result.blob,
+									this.plugin.settings.transcriber,
+									context
+								);
 
 								this.plugin.updateStatus('AI Editing...');
 								if (this.plugin.settings.editor.keepOriginal) {
@@ -156,7 +163,12 @@ export default class RecordModal extends Modal {
 								new Notice(`Raw transcript saved to ${rawPath}`);
 							}
 							new Notice('Editing transcript with AI using template: ' + selectedTemplateName);
-							const edited = await this.plugin.editorService.edit(transcript, this.plugin.settings.editor, selectedTemplate.prompt);
+							const edited = await this.plugin.editorService.edit(
+								transcript,
+								this.plugin.settings.editor,
+								selectedTemplate.prompt,
+								context
+							);
 							const editedFileName = `${baseName}_edited_transcript.md`;
 							const editedPath = await this.fileService.saveTextWithName(edited, transcriptDir, editedFileName);
 							new Notice(`Edited transcript saved to ${editedPath}`);
