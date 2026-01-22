@@ -163,7 +163,8 @@ export default class RecordModal extends Modal {
 								new Notice(`Raw transcript saved to ${rawPath}`);
 							}
 							new Notice('Editing transcript with AI using template: ' + selectedTemplateName);
-							const edited = await this.plugin.editorService.edit(
+							// Use two-stage editing to prevent transcript truncation
+							const edited = await this.plugin.editorService.editWithTwoStage(
 								transcript,
 								this.plugin.settings.editor,
 								selectedTemplate.prompt,

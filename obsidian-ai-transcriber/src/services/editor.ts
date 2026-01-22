@@ -90,12 +90,22 @@ ${text}`;
 			// Use Google GenAI SDK for Gemini editing
 			const { GoogleGenAI } = await import('@google/genai');
 			const genAI = new GoogleGenAI({ apiKey: settings.apiKey });
-			// Combine system prompt, user prompt, and transcript text
-			const geminiContent = systemPromptToUse
-				? `${systemPromptToUse}\n\n${settings.userPrompt ? `${settings.userPrompt}\n\n${text}` : text}`
-				: settings.userPrompt
-					? `${settings.userPrompt}\n\n${text}`
-					: text;
+			// Combine system prompt, user prompt, context, and transcript text
+			let geminiContent = systemPromptToUse ? `${systemPromptToUse}\n\n` : '';
+			if (settings.userPrompt) {
+				geminiContent += `${settings.userPrompt}\n\n`;
+			}
+			if (context && context.trim()) {
+				geminiContent += `【用户提供的会议背景（可选）】
+${context.trim()}
+【使用规则】
+- 用于帮助理解上下文
+- 若与逐字稿不一致，以逐字稿为准
+- 不得凭背景补充逐字稿未出现的事实
+
+`;
+			}
+			geminiContent += `【逐字稿】\n${text}`;
 
 			try {
 				const geminiResponse = await genAI.models.generateContent({
