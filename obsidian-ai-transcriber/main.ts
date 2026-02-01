@@ -140,13 +140,14 @@ export default class ObsidianAITranscriber extends Plugin {
 										const audioFileName = file.name;
 										const baseName = audioFileName.replace(/\.[^/.]+$/, '');
 
+										// Always save raw transcript first
+										const rawFileName = `${baseName}_raw_transcript.md`;
+										const rawPath = await this.fileService.saveTextWithName(transcript, dir, rawFileName);
+										new Notice(`Raw transcript saved to ${rawPath}`);
+
 										if (this.settings.editor.enabled && systemPromptOverride !== undefined) {
 											this.updateStatus('AI Editing...');
-											if (this.settings.editor.keepOriginal) {
-												const rawFileName = `${baseName}_raw_transcript.md`;
-												const rawPath = await this.fileService.saveTextWithName(transcript, dir, rawFileName);
-												new Notice(`Raw transcript saved to ${rawPath}`);
-											}
+											
 											new Notice('Editing transcript with AI using the selected template.'); // User already saw template name
 											// Use two-stage editing to prevent transcript truncation
 											const edited = await this.editorService.editWithTwoStage(
@@ -160,11 +161,8 @@ export default class ObsidianAITranscriber extends Plugin {
 											new Notice(`Edited transcript saved to ${editedPath}`);
 											await this.fileService.openFile(editedPath);
 										} else {
-											// Editor not enabled or no systemPromptOverride (should not happen if logic is correct)
-											const rawFileName = `${baseName}_raw_transcript.md`;
-											const transcriptPath = await this.fileService.saveTextWithName(transcript, dir, rawFileName);
-											new Notice(`Transcript saved to ${transcriptPath}`);
-											await this.fileService.openFile(transcriptPath);
+											// Editor not enabled, just open the raw file
+											await this.fileService.openFile(rawPath);
 										}
 									} catch (error: unknown) {
 										new Notice(`Error: ${(error as Error).message}`);

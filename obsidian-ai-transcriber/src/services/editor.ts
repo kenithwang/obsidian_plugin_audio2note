@@ -262,12 +262,30 @@ ${context.trim()}
 
 	/**
 	 * Format transcript in Stage 2
+	 * Uses chunking to prevent output truncation on large files.
+	 * Processes chunks in parallel with limited concurrency for speed.
 	 */
 	private async formatTranscript(rawTranscript: string, settings: EditorSettings): Promise<string> {
-		const formatPrompt = `You are a professional transcript formatter. Your task is to clean up and format the following transcript while preserving ALL content.
+		// Split transcript into safe chunks to stay within output token limits
+		const CHUNK_SIZE = 8000;
+		const MAX_CONCURRENCY = 3;
+		const chunks = this.splitTextIntoChunks(rawTranscript, CHUNK_SIZE);
+
+		console.info(`[AI Transcriber Editor] Formatting transcript in ${chunks.length} chunks (concurrency: ${MAX_CONCURRENCY})...`);
+
+		const formatResults: string[] = new Array(chunks.length);
+
+		// Process chunks in parallel batches
+		for (let i = 0; i < chunks.length; i += MAX_CONCURRENCY) {
+			const batch = chunks.slice(i, i + MAX_CONCURRENCY);
+			const batchPromises = batch.map(async (chunk, batchIndex) => {
+				const globalIndex = i + batchIndex;
+				console.info(`[AI Transcriber Editor] Processing chunk ${globalIndex + 1}/${chunks.length} (${chunk.length} chars)...`);
+
+				const formatPrompt = `You are a professional transcript formatter. Your task is to clean up and format the following transcript segment while preserving ALL content.
 
 **CRITICAL REQUIREMENTS:**
-1. **Preserve ALL content** - Do NOT truncate, summarize, or omit any part
+1. **Preserve ALL content** - Do NOT truncate, summarize, or omit any part. This is segment ${globalIndex + 1} of ${chunks.length}.
 2. **Language handling:**
    - If original is primarily English, keep it English
    - If original is primarily Chinese, convert to Simplified Chinese
@@ -275,21 +293,72 @@ ${context.trim()}
 3. **Clean up:**
    - Remove filler words (um, uh, ah, er, hmm)
    - Fix obvious typos
-   - Improve readability
-4. **Speaker identification:**
-   - If speaker names are mentioned, use actual names (e.g., "张三:", "John:")
-   - Otherwise use generic markers (Speaker 1:, Speaker 2:, etc.)
-5. **Paragraph breaks:**
-   - New paragraph when speaker changes
-   - New paragraph when topic shifts significantly
-   - Avoid large continuous blocks of text
+4. **Speaker markers:**
+   - Keep all Speaker markers exactly as they appear (Speaker 1:, Speaker 2:, etc.)
+   - Do NOT attempt to replace them with names
+5. **Format:**
+   - Output ONLY the clean transcript text.
+   - Do NOT add headers, footers, or explanatory notes.
 
-**Original Transcript:**
-${rawTranscript}
+**Transcript Segment:**
+${chunk}`;
 
-**Instructions:** Output the complete formatted transcript. DO NOT add any headers, summaries, or introductions - just the clean transcript text.`;
+				try {
+					const result = await this.generateContent(formatPrompt, settings, 0.1);
+					return result.trim();
+				} catch (error) {
+					console.error(`[AI Transcriber Editor] Chunk ${globalIndex + 1} failed after retries. Using raw text as fallback. Error:`, error);
+					return chunk.trim();
+				}
+			});
 
-		return await this.generateContent(formatPrompt, settings, 0.0);
+			const batchResults = await Promise.all(batchPromises);
+			batchResults.forEach((result, batchIndex) => {
+				formatResults[i + batchIndex] = result;
+			});
+		}
+
+		return formatResults.join('\n\n');
+	}
+
+	/**
+	 * Split text into chunks respecting paragraph boundaries
+	 */
+	private splitTextIntoChunks(text: string, maxLength: number): string[] {
+		const chunks: string[] = [];
+		let currentChunk = '';
+		
+		// Split by double newlines (paragraphs) first, then single newlines
+		const paragraphs = text.split(/\n\n+/); 
+
+		for (const para of paragraphs) {
+			// If adding this paragraph exceeds limit, push current chunk
+			if ((currentChunk.length + para.length) > maxLength && currentChunk.length > 0) {
+				chunks.push(currentChunk.trim());
+				currentChunk = '';
+			}
+
+			// If a single paragraph is huge (larger than limit), split it by lines
+			if (para.length > maxLength) {
+				const lines = para.split('\n');
+				for (const line of lines) {
+					if ((currentChunk.length + line.length) > maxLength && currentChunk.length > 0) {
+						chunks.push(currentChunk.trim());
+						currentChunk = '';
+					}
+					currentChunk += line + '\n';
+				}
+				currentChunk += '\n'; // Restore paragraph spacing
+			} else {
+				currentChunk += para + '\n\n';
+			}
+		}
+
+		if (currentChunk.trim()) {
+			chunks.push(currentChunk.trim());
+		}
+
+		return chunks;
 	}
 
 	/**
@@ -304,62 +373,96 @@ ${rawTranscript}
 	 * Generate content using the configured API
 	 */
 	private async generateContent(prompt: string, settings: EditorSettings, temperature: number): Promise<string> {
-		// Handle OpenAI provider
-		if (settings.provider === 'openai') {
-			const response = await fetch('https://api.openai.com/v1/chat/completions', {
-				method: 'POST',
-				headers: {
-					Authorization: `Bearer ${settings.apiKey}`,
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify({
-					model: settings.model,
-					messages: [{ role: 'user', content: prompt }],
-					temperature,
-					max_tokens: 65536,
-				}),
-			});
+		const MAX_RETRIES = 3;
+		let lastError: unknown;
 
-			if (!response.ok) {
-				const errorText = await response.text();
-				throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
-			}
-
-			const data = await response.json();
-			const result = data.choices?.[0]?.message?.content;
-			if (typeof result !== 'string') {
-				throw new Error('Invalid response from OpenAI API');
-			}
-			return result;
-		}
-
-		// Handle Gemini provider
-		if (settings.provider === 'gemini') {
-			const { GoogleGenAI } = await import('@google/genai');
-			const genAI = new GoogleGenAI({ apiKey: settings.apiKey });
-
+		for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
 			try {
-				const geminiResponse = await genAI.models.generateContent({
-					model: settings.model,
-					contents: [{ role: 'user', parts: [{ text: prompt }] }],
-					config: {
-						temperature,
-						maxOutputTokens: 65536,
-					},
-				});
+				// Handle OpenAI provider
+				if (settings.provider === 'openai') {
+					const response = await fetch('https://api.openai.com/v1/chat/completions', {
+						method: 'POST',
+						headers: {
+							Authorization: `Bearer ${settings.apiKey}`,
+							'Content-Type': 'application/json',
+						},
+						body: JSON.stringify({
+							model: settings.model,
+							messages: [{ role: 'user', content: prompt }],
+							temperature,
+							max_tokens: 65536,
+						}),
+					});
 
-				const result = geminiResponse.text;
-				if (typeof result === 'string') {
+					if (!response.ok) {
+						const errorText = await response.text();
+						throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
+					}
+
+					const data = await response.json();
+					const result = data.choices?.[0]?.message?.content;
+					if (typeof result !== 'string') {
+						throw new Error('Invalid response from OpenAI API');
+					}
 					return result;
-				} else {
-					throw new Error('Invalid response from Gemini API: No text content');
 				}
-			} catch (error: unknown) {
-				console.error('Error during Gemini API call:', error);
-				throw new Error(`Gemini API request failed: ${(error as Error).message || 'Unknown error'}`);
+
+				// Handle Gemini provider
+				if (settings.provider === 'gemini') {
+					const { GoogleGenAI, HarmCategory, HarmBlockThreshold } = await import('@google/genai');
+					const genAI = new GoogleGenAI({ apiKey: settings.apiKey });
+
+					const geminiResponse = await genAI.models.generateContent({
+						model: settings.model,
+						contents: [{ role: 'user', parts: [{ text: prompt }] }],
+						config: {
+							temperature,
+							maxOutputTokens: 65536,
+							safetySettings: [
+								{
+									category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+									threshold: HarmBlockThreshold.BLOCK_NONE,
+								},
+								{
+									category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+									threshold: HarmBlockThreshold.BLOCK_NONE,
+								},
+								{
+									category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+									threshold: HarmBlockThreshold.BLOCK_NONE,
+								},
+								{
+									category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+									threshold: HarmBlockThreshold.BLOCK_NONE,
+								},
+							],
+						},
+					});
+
+					const result = geminiResponse.text;
+					if (typeof result === 'string') {
+						return result;
+					} else {
+						// Log detailed safety feedback if available
+						console.error('Gemini API response missing text. Prompt Feedback:', geminiResponse.promptFeedback);
+						throw new Error('Invalid response from Gemini API: No text content (likely blocked by safety filters)');
+					}
+				}
+
+				throw new Error(`Unsupported provider: ${settings.provider}`);
+
+			} catch (error) {
+				lastError = error;
+				console.warn(`[AI Transcriber Editor] API Request failed (Attempt ${attempt}/${MAX_RETRIES}):`, error);
+				
+				if (attempt < MAX_RETRIES) {
+					// Exponential backoff: 1s, 2s, 4s...
+					await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt - 1)));
+				}
 			}
 		}
 
-		throw new Error(`Unsupported provider: ${settings.provider}`);
+		// If we exhausted all retries
+		throw new Error(`API request failed after ${MAX_RETRIES} attempts. Last error: ${(lastError as Error).message || 'Unknown error'}`);
 	}
 }
