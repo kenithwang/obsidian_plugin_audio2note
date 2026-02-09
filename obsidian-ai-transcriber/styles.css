@@ -7,6 +7,7 @@ If your plugin does not need CSS, delete this file.
 
 */
 
+/* ── Shared variables ── */
 .ai-transcriber-record-modal,
 .ai-transcriber-template-selection-modal,
 .ai-transcriber-participant-modal,
@@ -24,53 +25,6 @@ If your plugin does not need CSS, delete this file.
   --at-text: var(--text-normal);
   --at-accent: var(--interactive-accent);
   --at-accent-hover: var(--interactive-accent-hover);
-  --at-brand-cool: #0ea5a4;
-  --at-brand-warm: #f97316;
-  --at-brand-cool-soft: rgba(14, 165, 164, 0.22);
-  --at-brand-warm-soft: rgba(249, 115, 22, 0.2);
-  --at-brand-line: rgba(14, 165, 164, 0.36);
-  --at-brand-line-warm: rgba(249, 115, 22, 0.32);
-  position: relative;
-  overflow: hidden;
-  isolation: isolate;
-}
-
-.ai-transcriber-record-modal > *,
-.ai-transcriber-template-selection-modal > *,
-.ai-transcriber-participant-modal > *,
-.ai-transcriber-template-editor-modal > * {
-  position: relative;
-  z-index: 1;
-}
-
-.ai-transcriber-record-modal::before,
-.ai-transcriber-template-selection-modal::before,
-.ai-transcriber-participant-modal::before,
-.ai-transcriber-template-editor-modal::before {
-  content: '';
-  position: absolute;
-  width: 260px;
-  height: 260px;
-  right: -130px;
-  top: -140px;
-  background: radial-gradient(circle at center, var(--at-brand-cool-soft), transparent 70%);
-  pointer-events: none;
-  z-index: 0;
-}
-
-.ai-transcriber-record-modal::after,
-.ai-transcriber-template-selection-modal::after,
-.ai-transcriber-participant-modal::after,
-.ai-transcriber-template-editor-modal::after {
-  content: '';
-  position: absolute;
-  width: 260px;
-  height: 260px;
-  left: -150px;
-  bottom: -170px;
-  background: radial-gradient(circle at center, var(--at-brand-warm-soft), transparent 72%);
-  pointer-events: none;
-  z-index: 0;
 }
 
 @keyframes ai-transcriber-fade-up {
@@ -84,127 +38,20 @@ If your plugin does not need CSS, delete this file.
   }
 }
 
-/* Record modal */
-.ai-transcriber-record-modal {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  align-items: stretch;
-  min-width: 360px;
-  width: min(560px, calc(100vw - 56px));
-  max-width: 100%;
-  border-radius: var(--at-radius-xl);
-  border: var(--at-border);
-  background: var(--background-primary);
-  padding: 18px;
-  box-shadow: var(--at-shadow);
-  animation: ai-transcriber-fade-up 140ms ease-out;
-}
-
-.ai-transcriber-record-modal::before,
-.ai-transcriber-record-modal::after {
-  content: none;
-}
-
-.ai-transcriber-record-modal .record-header {
-  text-align: center;
-}
-
-.ai-transcriber-record-modal .record-header h2 {
-  margin: 0;
-  font-size: 1.3em;
-  font-weight: 650;
-  color: var(--at-text);
-}
-
-.ai-transcriber-record-modal .record-subtitle {
-  margin: 8px auto 0;
-  max-width: 34ch;
-  font-size: 0.9em;
-  line-height: 1.4;
-  color: var(--at-muted);
-}
-
-.ai-transcriber-record-modal .record-card {
-  padding: 16px;
-  border-radius: var(--at-radius-lg);
-  background: var(--at-surface);
-  border: var(--at-border-strong);
-  box-shadow: none;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.ai-transcriber-record-modal .recorder-timer {
-  font-family: var(--font-monospace);
-  font-size: clamp(2.1em, 4.5vw, 2.7em);
-  font-weight: 700;
-  line-height: 1;
-  text-align: center;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.03em;
-  padding: 12px 14px;
-  border-radius: var(--at-radius-md);
-  background: var(--background-primary);
-  border: var(--at-border-strong);
-  color: var(--at-text);
-}
-
-.ai-transcriber-record-modal .audio-waveform-wrap {
-  padding: 10px;
-  border-radius: var(--at-radius-md);
-  background: var(--background-primary);
-  border: var(--at-border-strong);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--background-modifier-border) 42%, transparent);
-}
-
-.ai-transcriber-record-modal .audio-waveform {
-  width: 100%;
-  height: 96px;
-  border-radius: 8px;
-  display: block;
-  background: transparent;
-}
-
-.ai-transcriber-record-modal .recorder-actions {
-  display: flex;
-  justify-content: center;
-  margin-top: 2px;
-}
-
-.ai-transcriber-record-modal .recorder-button-container {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  width: 100%;
-}
-
+/* ── Shared button styles ── */
 .ai-transcriber-record-modal .recorder-button-container button,
 .ai-transcriber-template-selection-modal button,
 .ai-transcriber-participant-modal button,
 .ai-transcriber-template-editor-modal button {
-  padding: 8px 13px;
+  padding: 8px 16px;
   min-height: 34px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--background-modifier-border) 70%, var(--at-brand-cool));
-  background: linear-gradient(180deg, var(--at-input), var(--background-primary));
+  border-radius: 8px;
+  border: var(--at-border);
+  background: var(--at-input);
   color: var(--at-text);
   font-weight: 600;
   cursor: pointer;
-  transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease, box-shadow 140ms ease;
-}
-
-.ai-transcriber-record-modal .recorder-button-container button {
-  width: 100%;
-  min-width: 0;
-  min-height: 36px;
-  padding: 9px 12px;
-  font-size: 0.92em;
-  border-radius: 9px;
-  border: var(--at-border);
-  background: var(--at-input);
-  box-shadow: none;
+  transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease;
 }
 
 .ai-transcriber-record-modal .recorder-button-container button:hover:not([disabled]),
@@ -235,37 +82,15 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-template-selection-modal button.mod-cta,
 .ai-transcriber-participant-modal button.mod-cta,
 .ai-transcriber-template-editor-modal button.mod-cta {
-  background: linear-gradient(120deg, var(--at-brand-cool), var(--at-brand-warm));
+  background: var(--at-accent);
   color: var(--text-on-accent);
-  border-color: transparent;
-  box-shadow:
-    0 8px 20px rgba(0, 0, 0, 0.2),
-    0 0 0 1px rgba(14, 165, 164, 0.2);
+  border-color: color-mix(in srgb, var(--at-accent) 70%, black 30%);
 }
 
 .ai-transcriber-record-modal .recorder-button-container button.mod-cta:hover:not([disabled]),
 .ai-transcriber-template-selection-modal button.mod-cta:hover:not([disabled]),
 .ai-transcriber-participant-modal button.mod-cta:hover:not([disabled]),
 .ai-transcriber-template-editor-modal button.mod-cta:hover:not([disabled]) {
-  filter: saturate(1.08) brightness(1.04);
-}
-
-.ai-transcriber-record-modal .recorder-button-container button:hover:not([disabled]) {
-  background: color-mix(in srgb, var(--at-input) 72%, var(--background-modifier-hover));
-}
-
-.ai-transcriber-record-modal .recorder-button-container button:active:not([disabled]) {
-  transform: translateY(1px);
-}
-
-.ai-transcriber-record-modal .recorder-button-container button.mod-cta {
-  background: var(--at-accent);
-  border-color: color-mix(in srgb, var(--at-accent) 70%, black 30%);
-  box-shadow: none;
-}
-
-.ai-transcriber-record-modal .recorder-button-container button.mod-cta:hover:not([disabled]) {
-  filter: none;
   background: var(--at-accent-hover);
   border-color: color-mix(in srgb, var(--at-accent-hover) 70%, black 30%);
 }
@@ -276,6 +101,140 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-template-editor-modal button:focus-visible {
   outline: 2px solid var(--at-accent-hover);
   outline-offset: 2px;
+}
+
+/* ── Shared input styles ── */
+.ai-transcriber-template-selection-modal textarea,
+.ai-transcriber-template-selection-modal input[type="text"],
+.ai-transcriber-template-selection-modal select,
+.ai-transcriber-participant-modal textarea,
+.ai-transcriber-participant-modal input[type="text"],
+.ai-transcriber-template-editor-modal textarea,
+.ai-transcriber-template-editor-modal input[type="text"] {
+  width: 100%;
+  min-width: 220px;
+  box-sizing: border-box;
+  border-radius: var(--at-radius-md);
+  border: var(--at-border);
+  background: var(--at-input);
+  padding: 8px 10px;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.ai-transcriber-template-selection-modal textarea:focus,
+.ai-transcriber-template-selection-modal input[type="text"]:focus,
+.ai-transcriber-template-selection-modal select:focus,
+.ai-transcriber-participant-modal textarea:focus,
+.ai-transcriber-participant-modal input[type="text"]:focus,
+.ai-transcriber-template-editor-modal textarea:focus,
+.ai-transcriber-template-editor-modal input[type="text"]:focus {
+  border-color: var(--at-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--at-accent) 16%, transparent);
+  outline: none;
+}
+
+/* ══════════════════════════════════════════════
+   Record modal
+   ══════════════════════════════════════════════ */
+.ai-transcriber-record-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  align-items: stretch;
+  min-width: 360px;
+  width: min(560px, calc(100vw - 56px));
+  max-width: 100%;
+  border-radius: var(--at-radius-xl);
+  border: var(--at-border);
+  background: var(--background-primary);
+  padding: 18px;
+  box-shadow: var(--at-shadow);
+  animation: ai-transcriber-fade-up 140ms ease-out;
+}
+
+.ai-transcriber-record-modal .record-header {
+  text-align: center;
+}
+
+.ai-transcriber-record-modal .record-header h2 {
+  margin: 0;
+  font-size: 1.3em;
+  font-weight: 650;
+  color: var(--at-text);
+}
+
+.ai-transcriber-record-modal .record-subtitle {
+  margin: 8px auto 0;
+  max-width: 34ch;
+  font-size: 0.9em;
+  line-height: 1.4;
+  color: var(--at-muted);
+}
+
+.ai-transcriber-record-modal .record-card {
+  padding: 16px;
+  border-radius: var(--at-radius-lg);
+  background: var(--at-surface);
+  border: var(--at-border-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ai-transcriber-record-modal .recorder-timer {
+  font-family: var(--font-monospace);
+  font-size: clamp(2.1em, 4.5vw, 2.7em);
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.03em;
+  padding: 12px 14px;
+  border-radius: var(--at-radius-md);
+  background: var(--background-primary);
+  border: var(--at-border-strong);
+  color: var(--at-text);
+}
+
+.ai-transcriber-record-modal .audio-waveform-wrap {
+  padding: 10px;
+  border-radius: var(--at-radius-md);
+  background: var(--background-primary);
+  border: var(--at-border-strong);
+}
+
+.ai-transcriber-record-modal .audio-waveform {
+  width: 100%;
+  height: 96px;
+  border-radius: 8px;
+  display: block;
+  background: transparent;
+}
+
+.ai-transcriber-record-modal .recorder-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 2px;
+}
+
+.ai-transcriber-record-modal .recorder-button-container {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.ai-transcriber-record-modal .recorder-button-container button {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 9px 12px;
+  font-size: 0.92em;
+  border-radius: 9px;
+}
+
+.ai-transcriber-record-modal .recorder-button-container button:hover:not([disabled]) {
+  background: color-mix(in srgb, var(--at-input) 72%, var(--background-modifier-hover));
 }
 
 .ai-transcriber-record-modal .recorder-btn-record {
@@ -314,12 +273,196 @@ If your plugin does not need CSS, delete this file.
 }
 
 .ai-transcriber-record-modal.is-paused .recorder-timer {
-  background: color-mix(in srgb, var(--background-primary) 90%, var(--at-brand-warm) 10%);
-  border-color: color-mix(in srgb, var(--background-modifier-border-hover) 75%, var(--at-brand-warm) 25%);
   opacity: 0.9;
 }
 
-/* Settings tab controls */
+/* ══════════════════════════════════════════════
+   Template selection modal
+   ══════════════════════════════════════════════ */
+.ai-transcriber-template-selection-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  align-items: stretch;
+  min-width: 360px;
+  width: min(560px, calc(100vw - 56px));
+  max-width: 100%;
+  max-height: min(80vh, 980px);
+  overflow-y: auto;
+  border-radius: var(--at-radius-xl);
+  border: var(--at-border);
+  background: var(--background-primary);
+  padding: 18px;
+  box-shadow: var(--at-shadow);
+  animation: ai-transcriber-fade-up 140ms ease-out;
+}
+
+.ai-transcriber-template-selection-modal .tpl-header {
+  text-align: center;
+}
+
+.ai-transcriber-template-selection-modal .tpl-header h2 {
+  margin: 0;
+  font-size: 1.3em;
+  font-weight: 650;
+  color: var(--at-text);
+}
+
+/* Card-like sections */
+.ai-transcriber-template-selection-modal .tpl-section {
+  padding: 14px;
+  border-radius: var(--at-radius-lg);
+  background: var(--at-surface);
+  border: var(--at-border-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ai-transcriber-template-selection-modal .tpl-section .setting-item {
+  border: none;
+  padding: 4px 0;
+}
+
+.ai-transcriber-template-selection-modal .tpl-section-header {
+  border-bottom: var(--at-border) !important;
+  padding-bottom: 10px !important;
+  margin-bottom: 2px;
+}
+
+.ai-transcriber-template-selection-modal .tpl-section .setting-item-info {
+  padding-right: 12px;
+}
+
+.ai-transcriber-template-selection-modal .tpl-section .setting-item-name {
+  font-weight: 600;
+  color: var(--at-text);
+}
+
+.ai-transcriber-template-selection-modal .tpl-section .setting-item-description {
+  color: var(--at-muted);
+  margin-top: 2px;
+}
+
+.ai-transcriber-template-selection-modal .tpl-section .setting-item-control {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Participant list inside section */
+.ai-transcriber-template-selection-modal .tpl-participant-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ai-transcriber-template-selection-modal .tpl-participant-list .setting-item {
+  padding: 8px 10px;
+  border-radius: var(--at-radius-md);
+  background: var(--background-primary);
+  border: var(--at-border) !important;
+  transition: background-color 140ms ease;
+}
+
+.ai-transcriber-template-selection-modal .tpl-participant-list .setting-item:hover {
+  background: var(--background-primary-alt);
+}
+
+/* Empty hint */
+.ai-transcriber-template-selection-modal .tpl-empty-hint {
+  padding: 10px 12px;
+  border-radius: var(--at-radius-md);
+  background: var(--background-primary);
+  color: var(--at-muted);
+  border: 1px dashed var(--background-modifier-border);
+  text-align: center;
+  font-size: 0.9em;
+}
+
+/* Action bar at bottom */
+.ai-transcriber-template-selection-modal .tpl-actions {
+  padding-top: 4px;
+}
+
+.ai-transcriber-template-selection-modal .tpl-actions .setting-item {
+  border: none;
+  padding: 0;
+  justify-content: flex-end;
+}
+
+.ai-transcriber-template-selection-modal .tpl-actions .setting-item-control {
+  gap: 8px;
+}
+
+.ai-transcriber-template-selection-modal .tpl-actions button {
+  min-width: 80px;
+  padding: 10px 20px;
+  font-size: 0.95em;
+}
+
+.ai-transcriber-template-selection-modal .tpl-actions button.mod-cta {
+  min-width: 120px;
+}
+
+/* ══════════════════════════════════════════════
+   Participant modal & Template editor modal
+   ══════════════════════════════════════════════ */
+.ai-transcriber-participant-modal,
+.ai-transcriber-template-editor-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  align-items: stretch;
+  min-width: 360px;
+  width: min(520px, calc(100vw - 56px));
+  max-width: 100%;
+  border-radius: var(--at-radius-xl);
+  border: var(--at-border);
+  background: var(--background-primary);
+  padding: 18px;
+  box-shadow: var(--at-shadow);
+  animation: ai-transcriber-fade-up 140ms ease-out;
+}
+
+.ai-transcriber-participant-modal h2,
+.ai-transcriber-template-editor-modal h2 {
+  margin: 0;
+  font-size: 1.3em;
+  font-weight: 650;
+  color: var(--at-text);
+}
+
+.ai-transcriber-participant-modal .setting-item,
+.ai-transcriber-template-editor-modal .setting-item {
+  border: none;
+  padding: 4px 0;
+}
+
+.ai-transcriber-participant-modal .setting-item:last-child,
+.ai-transcriber-template-editor-modal .setting-item:last-child {
+  padding-top: 8px;
+  border-top: var(--at-border);
+  margin-top: 4px;
+  justify-content: flex-end;
+}
+
+.ai-transcriber-participant-modal .setting-item-control,
+.ai-transcriber-template-editor-modal .setting-item-control {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ai-transcriber-participant-modal textarea {
+  min-height: 76px;
+}
+
+.ai-transcriber-template-editor-modal textarea {
+  min-height: 180px;
+}
+
+/* ══════════════════════════════════════════════
+   Settings tab
+   ══════════════════════════════════════════════ */
 .ai-transcriber-settings .setting-item-control {
   flex: 0 1 clamp(280px, 52vw, 560px) !important;
   max-width: clamp(280px, 52vw, 560px) !important;
@@ -335,187 +478,9 @@ If your plugin does not need CSS, delete this file.
   resize: none !important;
 }
 
-/* Template selection modal */
-.ai-transcriber-template-selection-modal {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-width: 420px;
-  max-width: min(860px, 92vw);
-  max-height: min(78vh, 980px);
-  overflow-y: auto;
-  border-radius: var(--at-radius-xl);
-  border: 1px solid var(--at-brand-line);
-  background:
-    linear-gradient(160deg, rgba(14, 165, 164, 0.06), transparent 40%),
-    linear-gradient(20deg, rgba(249, 115, 22, 0.06), transparent 35%),
-    linear-gradient(160deg, var(--background-primary), var(--background-secondary));
-  padding: 14px;
-  box-shadow:
-    0 0 0 1px rgba(14, 165, 164, 0.08),
-    var(--shadow-s, 0 10px 26px rgba(0, 0, 0, 0.18));
-  animation: ai-transcriber-fade-up 180ms ease-out;
-}
-
-.ai-transcriber-template-selection-modal h2 {
-  margin: 0 0 4px;
-  font-size: 1.32em;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-  color: color-mix(in srgb, var(--at-text) 84%, var(--at-brand-cool));
-}
-
-.ai-transcriber-template-selection-modal .setting-item {
-  position: relative;
-  overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--background-modifier-border) 72%, var(--at-brand-cool));
-  border-radius: var(--at-radius-lg);
-  padding: 10px 12px;
-  background: linear-gradient(160deg, var(--at-surface), var(--at-surface-alt));
-  align-items: flex-start;
-  transition: border-color 140ms ease, box-shadow 140ms ease;
-}
-
-.ai-transcriber-template-selection-modal .setting-item::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 4px;
-  background: linear-gradient(180deg, var(--at-brand-cool), var(--at-brand-warm));
-  opacity: 0.8;
-}
-
-.ai-transcriber-template-selection-modal .setting-item:hover {
-  border-color: var(--at-brand-line-warm);
-  box-shadow: var(--shadow-xs, 0 2px 10px rgba(0, 0, 0, 0.12));
-}
-
-.ai-transcriber-template-selection-modal .setting-item-info {
-  padding-right: 12px;
-}
-
-.ai-transcriber-template-selection-modal .setting-item-name {
-  font-weight: 600;
-  color: var(--at-text);
-}
-
-.ai-transcriber-template-selection-modal .setting-item-description {
-  color: var(--at-muted);
-  margin-top: 3px;
-}
-
-.ai-transcriber-template-selection-modal .setting-item-control {
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.ai-transcriber-template-selection-modal textarea,
-.ai-transcriber-template-selection-modal input[type="text"],
-.ai-transcriber-template-selection-modal select,
-.ai-transcriber-participant-modal textarea,
-.ai-transcriber-participant-modal input[type="text"],
-.ai-transcriber-template-editor-modal textarea,
-.ai-transcriber-template-editor-modal input[type="text"] {
-  width: 100%;
-  min-width: 220px;
-  box-sizing: border-box;
-  border-radius: 10px;
-  border: var(--at-border);
-  background: var(--at-input);
-  padding: 8px 10px;
-  transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
-}
-
-.ai-transcriber-template-selection-modal textarea:focus,
-.ai-transcriber-template-selection-modal input[type="text"]:focus,
-.ai-transcriber-template-selection-modal select:focus,
-.ai-transcriber-participant-modal textarea:focus,
-.ai-transcriber-participant-modal input[type="text"]:focus,
-.ai-transcriber-template-editor-modal textarea:focus,
-.ai-transcriber-template-editor-modal input[type="text"]:focus {
-  border-color: var(--at-brand-line-warm);
-  box-shadow: 0 0 0 2px rgba(14, 165, 164, 0.16);
-  background: color-mix(in srgb, var(--at-input) 90%, white);
-  outline: none;
-}
-
-.ai-transcriber-template-selection-modal textarea,
-.ai-transcriber-participant-modal textarea {
-  min-height: 76px;
-}
-
-.ai-transcriber-template-selection-modal > div:not(.setting-item) {
-  padding: 9px 10px;
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--at-surface) 86%, var(--at-brand-cool-soft));
-  color: var(--at-muted);
-  border: 1px dashed var(--at-brand-line);
-}
-
-/* Participant modal */
-.ai-transcriber-participant-modal,
-.ai-transcriber-template-editor-modal {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-width: 420px;
-  max-width: min(760px, 92vw);
-  border-radius: var(--at-radius-xl);
-  border: 1px solid var(--at-brand-line);
-  background:
-    linear-gradient(160deg, rgba(14, 165, 164, 0.06), transparent 40%),
-    linear-gradient(20deg, rgba(249, 115, 22, 0.06), transparent 35%),
-    linear-gradient(160deg, var(--background-primary), var(--background-secondary));
-  padding: 14px;
-  box-shadow:
-    0 0 0 1px rgba(14, 165, 164, 0.08),
-    var(--shadow-s, 0 10px 26px rgba(0, 0, 0, 0.18));
-  animation: ai-transcriber-fade-up 180ms ease-out;
-}
-
-.ai-transcriber-participant-modal h2,
-.ai-transcriber-template-editor-modal h2 {
-  margin: 0;
-  font-size: 1.3em;
-  font-weight: 700;
-  color: color-mix(in srgb, var(--at-text) 84%, var(--at-brand-cool));
-}
-
-.ai-transcriber-participant-modal .setting-item,
-.ai-transcriber-template-editor-modal .setting-item {
-  position: relative;
-  overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--background-modifier-border) 72%, var(--at-brand-cool));
-  border-radius: var(--at-radius-lg);
-  padding: 10px 12px;
-  background: linear-gradient(160deg, var(--at-surface), var(--at-surface-alt));
-}
-
-.ai-transcriber-participant-modal .setting-item::before,
-.ai-transcriber-template-editor-modal .setting-item::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 4px;
-  background: linear-gradient(180deg, var(--at-brand-cool), var(--at-brand-warm));
-  opacity: 0.8;
-}
-
-.ai-transcriber-participant-modal .setting-item-control,
-.ai-transcriber-template-editor-modal .setting-item-control {
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.ai-transcriber-template-editor-modal textarea {
-  min-height: 180px;
-}
-
-/* Mobile */
+/* ══════════════════════════════════════════════
+   Mobile
+   ══════════════════════════════════════════════ */
 @media (max-width: 768px) {
   .ai-transcriber-record-modal,
   .ai-transcriber-template-selection-modal,
@@ -524,14 +489,8 @@ If your plugin does not need CSS, delete this file.
     min-width: 0;
     width: min(100vw - 26px, 100%);
     max-width: 100%;
-    padding: 12px;
-    border-radius: 14px;
-  }
-
-  .ai-transcriber-record-modal {
-    width: min(100vw - 26px, 100%);
-    min-width: 0;
     padding: 14px;
+    border-radius: 14px;
   }
 
   .ai-transcriber-record-modal .recorder-button-container {
@@ -540,12 +499,6 @@ If your plugin does not need CSS, delete this file.
 
   .ai-transcriber-record-modal .recorder-button-container button {
     min-width: 0;
-  }
-
-  .ai-transcriber-template-selection-modal .setting-item,
-  .ai-transcriber-participant-modal .setting-item,
-  .ai-transcriber-template-editor-modal .setting-item {
-    padding: 9px 10px;
   }
 
   .ai-transcriber-settings .setting-item-control {
