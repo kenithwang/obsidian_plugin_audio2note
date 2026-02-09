@@ -10,12 +10,10 @@ async function getGenAIModule() {
 	return genaiModule;
 }
 
-type EditorStage = 'summary' | 'transcript' | 'done';
+type EditorStage = 'summary' | 'done';
 
 export interface EditProgress {
 	stage: EditorStage;
-	currentChunk?: number;
-	totalChunks?: number;
 }
 
 export interface EditStreamingOptions {
@@ -153,7 +151,7 @@ ${context.trim()}
 	}
 
 	/**
-	 * Two-stage editing approach to prevent transcript truncation.
+	 * Summary generation + raw transcript concatenation.
 	 * Non-streaming wrapper that reuses the streaming pipeline.
 	 */
 	async editWithTwoStage(
@@ -171,10 +169,9 @@ ${context.trim()}
 	}
 
 	/**
-	 * Two-stage editing with streaming output callbacks.
+	 * Summary generation + raw transcript concatenation with streaming output.
 	 * Stage 1: Generate summary/analysis sections.
-	 * Stage 2: Format complete transcript chunk-by-chunk with streaming updates.
-	 * Stage 3: Combine both parts.
+	 * Stage 2: Combine summary with raw transcript.
 	 */
 	async editWithTwoStageStreaming(
 		text: string,
@@ -191,7 +188,7 @@ ${context.trim()}
 		const systemPromptToUse = this.resolveSystemPrompt(settings, systemPromptOverride);
 		const rawTranscript = this.extractRawTranscript(text);
 
-		console.info('[AI Transcriber Editor] Starting two-stage streaming generation...');
+		console.info('[AI Transcriber Editor] Starting summary generation...');
 
 		this.emitProgress(options, { stage: 'summary' });
 
@@ -221,19 +218,12 @@ ${context.trim()}
 		}
 
 		this.throwIfAborted(options?.signal);
-		console.info('[AI Transcriber Editor] Stage 1 complete, length:', summaryPart.length);
+		console.info('[AI Transcriber Editor] Summary complete, length:', summaryPart.length);
 
-		const transcriptPart = await this.formatTranscriptStreaming(
-			rawTranscript,
-			settings,
-			summaryPart,
-			options,
-		);
-
-		const finalNote = this.combineParts(summaryPart, transcriptPart);
+		const finalNote = this.combineParts(summaryPart, rawTranscript);
 		this.emitProgress(options, { stage: 'done' });
 		options?.onPartialText?.(finalNote);
-		console.info('[AI Transcriber Editor] Two-stage streaming generation complete, total length:', finalNote.length);
+		console.info('[AI Transcriber Editor] Generation complete, total length:', finalNote.length);
 		return finalNote;
 	}
 
@@ -285,124 +275,7 @@ ${context.trim()}
 	}
 
 	/**
-	 * Stream transcript formatting chunk-by-chunk so the caller can write partial output.
-	 */
-	private async formatTranscriptStreaming(
-		rawTranscript: string,
-		settings: EditorSettings,
-		summaryPart: string,
-		options?: EditStreamingOptions,
-	): Promise<string> {
-		const CHUNK_SIZE = 8000;
-		const chunks = this.splitTextIntoChunks(rawTranscript, CHUNK_SIZE);
-		const results: string[] = [];
-
-		console.info(`[AI Transcriber Editor] Formatting transcript in ${chunks.length} chunk(s) with streaming...`);
-
-		for (let i = 0; i < chunks.length; i++) {
-			this.throwIfAborted(options?.signal);
-
-			const chunkIndex = i + 1;
-			this.emitProgress(options, { stage: 'transcript', currentChunk: chunkIndex, totalChunks: chunks.length });
-
-			const chunk = chunks[i];
-			const formatPrompt = this.buildFormatPrompt(chunk, chunkIndex, chunks.length);
-			let formattedChunk = '';
-
-			try {
-				formattedChunk = await this.generateContentStream(
-					formatPrompt,
-					settings,
-					0.1,
-					options?.signal,
-					(_, accumulated) => {
-						const partialTranscript = [...results, accumulated.trim()].filter(Boolean).join('\n\n');
-						const partial = this.combineParts(summaryPart, partialTranscript);
-						options?.onPartialText?.(partial);
-					},
-				);
-			} catch (error) {
-				if (this.isAbortError(error)) throw error;
-				console.warn(`[AI Transcriber Editor] Streaming failed for chunk ${chunkIndex}. Falling back to non-stream mode.`, error);
-				try {
-					formattedChunk = await this.generateContent(formatPrompt, settings, 0.1, options?.signal);
-				} catch (innerError) {
-					if (this.isAbortError(innerError)) throw innerError;
-					console.error(`[AI Transcriber Editor] Chunk ${chunkIndex} failed after retries. Using raw text fallback.`, innerError);
-					formattedChunk = chunk;
-				}
-			}
-
-			results.push(formattedChunk.trim());
-
-			const partialTranscript = results.join('\n\n');
-			options?.onPartialText?.(this.combineParts(summaryPart, partialTranscript));
-		}
-
-		return results.join('\n\n').trim();
-	}
-
-	private buildFormatPrompt(chunk: string, chunkIndex: number, totalChunks: number): string {
-		return `You are a professional transcript formatter. Your task is to clean up and format the following transcript segment while preserving ALL content.
-
-**CRITICAL REQUIREMENTS:**
-1. **Preserve ALL content** - Do NOT truncate, summarize, or omit any part. This is segment ${chunkIndex} of ${totalChunks}.
-2. **Language handling:**
-   - If original is primarily English, keep it English
-   - If original is primarily Chinese, convert to Simplified Chinese
-   - Other languages: translate to Simplified Chinese
-3. **Clean up:**
-   - Remove filler words (um, uh, ah, er, hmm)
-   - Fix obvious typos
-4. **Speaker markers:**
-   - Keep all Speaker markers exactly as they appear (Speaker 1:, Speaker 2:, etc.)
-   - Do NOT attempt to replace them with names
-5. **Format:**
-   - Output ONLY the clean transcript text.
-   - Do NOT add headers, footers, or explanatory notes.
-
-**Transcript Segment:**
-${chunk}`;
-	}
-
-	/**
-	 * Split text into chunks respecting paragraph boundaries.
-	 */
-	private splitTextIntoChunks(text: string, maxLength: number): string[] {
-		const chunks: string[] = [];
-		let currentChunk = '';
-		const paragraphs = text.split(/\n\n+/);
-
-		for (const para of paragraphs) {
-			if (currentChunk.length + para.length > maxLength && currentChunk.length > 0) {
-				chunks.push(currentChunk.trim());
-				currentChunk = '';
-			}
-
-			if (para.length > maxLength) {
-				const lines = para.split('\n');
-				for (const line of lines) {
-					if (currentChunk.length + line.length > maxLength && currentChunk.length > 0) {
-						chunks.push(currentChunk.trim());
-						currentChunk = '';
-					}
-					currentChunk += `${line}\n`;
-				}
-				currentChunk += '\n';
-			} else {
-				currentChunk += `${para}\n\n`;
-			}
-		}
-
-		if (currentChunk.trim()) {
-			chunks.push(currentChunk.trim());
-		}
-
-		return chunks;
-	}
-
-	/**
-	 * Combine summary and formatted transcript.
+	 * Combine summary and raw transcript.
 	 */
 	private combineParts(summary: string, formattedTranscript: string): string {
 		const trimmedSummary = summary.trim();
