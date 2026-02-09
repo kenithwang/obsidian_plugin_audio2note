@@ -324,12 +324,6 @@ export default class ObsidianAITranscriber extends Plugin {
 		if (progress.stage === 'summary') {
 			return t('statusEditingSummary');
 		}
-		if (progress.stage === 'transcript') {
-			return t('statusEditingTranscript', {
-				current: progress.currentChunk ?? 0,
-				total: progress.totalChunks ?? 0,
-			});
-		}
 		return t('statusEditing');
 	}
 
