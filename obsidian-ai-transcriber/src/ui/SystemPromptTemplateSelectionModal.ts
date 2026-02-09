@@ -31,14 +31,12 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.addClass('ai-transcriber-template-selection-modal');
-		contentEl.createEl('h2', { text: t('templateSelectTitle') });
 
 		const templates = this.plugin.settings.editor.systemPromptTemplates;
 		if (!this.plugin.settings.editor.participants) {
 			this.plugin.settings.editor.participants = [];
 		}
 		if (!templates || templates.length === 0) {
-			// Should not happen if 'Default' template is always ensured
 			contentEl.createEl('p', { text: 'No system prompt templates found. Please create one in settings.' });
 			new Setting(contentEl).addButton(btn =>
 				btn
@@ -52,7 +50,13 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 			return;
 		}
 
-		new Setting(contentEl)
+		// --- Header ---
+		const headerEl = contentEl.createDiv({ cls: 'tpl-header' });
+		headerEl.createEl('h2', { text: t('templateSelectTitle') });
+
+		// --- Template selection section ---
+		const templateSection = contentEl.createDiv({ cls: 'tpl-section' });
+		new Setting(templateSection)
 			.setName(t('templateLabel'))
 			.setDesc(t('templateDesc'))
 			.addDropdown(dropdown => {
@@ -65,27 +69,34 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 				});
 			});
 
-		new Setting(contentEl)
+		// --- Participants section ---
+		const participantSection = contentEl.createDiv({ cls: 'tpl-section' });
+		const participantHeader = new Setting(participantSection)
 			.setName(t('participantsLabel'))
-			.setDesc(t('participantsDesc'))
-			.addButton(btn =>
-				btn
-					.setButtonText(t('participantsAdd'))
-					.setCta()
-					.onClick(() => {
-						new ParticipantModal(this.app, this.plugin, participant => {
-							if (!participant) return;
-							this.plugin.settings.editor.participants.push(participant);
-							this.plugin.saveSettings().then(() => this.onOpen());
-						}).open();
-					})
-			);
+			.setDesc(t('participantsDesc'));
+		participantHeader.settingEl.addClass('tpl-section-header');
+		participantHeader.addButton(btn =>
+			btn
+				.setButtonText(t('participantsAdd'))
+				.setCta()
+				.onClick(() => {
+					new ParticipantModal(this.app, this.plugin, participant => {
+						if (!participant) return;
+						this.plugin.settings.editor.participants.push(participant);
+						this.plugin.saveSettings().then(() => this.onOpen());
+					}).open();
+				})
+		);
 
 		if (this.plugin.settings.editor.participants.length === 0) {
-			contentEl.createEl('div', { text: t('participantsEmpty') });
+			participantSection.createEl('div', {
+				text: t('participantsEmpty'),
+				cls: 'tpl-empty-hint',
+			});
 		} else {
+			const listEl = participantSection.createDiv({ cls: 'tpl-participant-list' });
 			this.plugin.settings.editor.participants.forEach(participant => {
-				new Setting(contentEl)
+				new Setting(listEl)
 					.setName(
 						participant.name + (participant.org ? ` (${participant.org})` : '')
 					)
@@ -143,7 +154,9 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 			});
 		}
 
-		new Setting(contentEl)
+		// --- Meeting purpose section ---
+		const purposeSection = contentEl.createDiv({ cls: 'tpl-section' });
+		new Setting(purposeSection)
 			.setName(t('meetingPurposeLabel'))
 			.setDesc(t('meetingPurposeDesc'))
 			.addTextArea(text => {
@@ -156,7 +169,9 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 				text.inputEl.style.width = '100%';
 			});
 
-		new Setting(contentEl)
+		// --- Action buttons ---
+		const actionsEl = contentEl.createDiv({ cls: 'tpl-actions' });
+		new Setting(actionsEl)
 			.addButton(btn =>
 				btn.setButtonText(t('cancel')).onClick(() => {
 					this.onSubmit(null);
