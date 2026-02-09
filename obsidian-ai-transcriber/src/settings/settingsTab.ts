@@ -1,13 +1,161 @@
 import { App, PluginSettingTab, Setting, Modal, TextComponent, TextAreaComponent, Notice } from 'obsidian';
 import ObsidianAITranscriber from '../../main';
 import { SystemPromptTemplate } from './types';
+import { t } from '../i18n';
 
 export default class SettingsTab extends PluginSettingTab {
 	plugin: ObsidianAITranscriber;
+	private saveDebounceTimer: number | null = null;
+	private readonly SAVE_DEBOUNCE_MS = 500;
 
 	constructor(app: App, plugin: ObsidianAITranscriber) {
 		super(app, plugin);
 		this.plugin = plugin;
+	}
+
+	private scheduleSave(): void {
+		if (this.saveDebounceTimer !== null) {
+			window.clearTimeout(this.saveDebounceTimer);
+		}
+		this.saveDebounceTimer = window.setTimeout(() => {
+			this.saveDebounceTimer = null;
+			void this.plugin.saveSettings();
+		}, this.SAVE_DEBOUNCE_MS);
+	}
+
+	private async flushPendingSave(): Promise<void> {
+		if (this.saveDebounceTimer !== null) {
+			window.clearTimeout(this.saveDebounceTimer);
+			this.saveDebounceTimer = null;
+		}
+		await this.plugin.saveSettings();
+	}
+
+	private ensureUniqueTemplateName(name: string, existing: Set<string>): string {
+		let candidate = name.trim() || 'Imported Template';
+		if (!existing.has(candidate)) return candidate;
+		let i = 1;
+		while (existing.has(`${candidate} (${i})`)) {
+			i++;
+		}
+		return `${candidate} (${i})`;
+	}
+
+	private exportTemplates(): void {
+		const payload = {
+			version: 1,
+			activeTemplateName: this.plugin.settings.editor.activeSystemPromptTemplateName,
+			templates: this.plugin.settings.editor.systemPromptTemplates,
+		};
+		const json = JSON.stringify(payload, null, 2);
+		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+		const filename = `ai-transcriber-templates-${timestamp}.json`;
+		const blob = new Blob([json], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const anchor = document.createElement('a');
+		anchor.href = url;
+		anchor.download = filename;
+		anchor.click();
+		URL.revokeObjectURL(url);
+		new Notice(t('noticeTemplatesExported', { filename }));
+	}
+
+	private async importTemplatesFromFile(): Promise<void> {
+		const input = document.createElement('input');
+		input.type = 'file';
+		input.accept = '.json,application/json';
+
+		const file = await new Promise<File | null>(resolve => {
+			input.onchange = () => resolve(input.files?.[0] ?? null);
+			input.click();
+		});
+
+		if (!file) return;
+
+		let rawText = '';
+		try {
+			rawText = await file.text();
+		} catch {
+			new Notice(t('noticeTemplateImportReadFailed'));
+			return;
+		}
+
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(rawText);
+		} catch {
+			new Notice(t('noticeTemplateImportInvalid'));
+			return;
+		}
+
+		const importData = (() => {
+			if (Array.isArray(parsed)) {
+				return {
+					activeTemplateName: undefined,
+					templates: parsed,
+				};
+			}
+			if (
+				parsed &&
+				typeof parsed === 'object' &&
+				Array.isArray((parsed as { templates?: unknown }).templates)
+			) {
+				return {
+					activeTemplateName: (parsed as { activeTemplateName?: unknown }).activeTemplateName,
+					templates: (parsed as { templates: unknown[] }).templates,
+				};
+			}
+			return null;
+		})();
+
+		if (!importData) {
+			new Notice(t('noticeTemplateImportInvalid'));
+			return;
+		}
+
+		const existingNames = new Set(
+			this.plugin.settings.editor.systemPromptTemplates.map(template => template.name),
+		);
+
+		const imported: SystemPromptTemplate[] = [];
+		for (const item of importData.templates) {
+			if (!item || typeof item !== 'object') continue;
+			const candidate = item as { name?: unknown; prompt?: unknown };
+			if (typeof candidate.prompt !== 'string') continue;
+			const baseName = typeof candidate.name === 'string' ? candidate.name : 'Imported Template';
+			const uniqueName = this.ensureUniqueTemplateName(baseName, existingNames);
+			existingNames.add(uniqueName);
+			imported.push({
+				name: uniqueName,
+				prompt: candidate.prompt,
+			});
+		}
+
+		if (!imported.length) {
+			new Notice(t('noticeTemplateImportEmpty'));
+			return;
+		}
+
+		this.plugin.settings.editor.systemPromptTemplates.push(...imported);
+		if (
+			typeof importData.activeTemplateName === 'string' &&
+			imported.some(template => template.name === importData.activeTemplateName)
+		) {
+			this.plugin.settings.editor.activeSystemPromptTemplateName = importData.activeTemplateName;
+		} else if (!this.plugin.settings.editor.activeSystemPromptTemplateName) {
+			this.plugin.settings.editor.activeSystemPromptTemplateName = imported[0].name;
+		}
+
+		await this.flushPendingSave();
+		new Notice(t('noticeTemplateImportSuccess', { count: imported.length }));
+		this.display();
+	}
+
+	hide(): void {
+		void this.flushPendingSave().catch(error => {
+			console.error('[AI Transcriber] Failed to flush settings on close:', error);
+		});
+		super.hide();
 	}
 
 	private getActiveTemplate(): SystemPromptTemplate | undefined {
@@ -57,30 +205,31 @@ export default class SettingsTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.transcriber.provider)
 				.onChange(async (value) => {
 					this.plugin.settings.transcriber.provider = value as 'openai' | 'gemini';
-					await this.plugin.saveSettings();
+					await this.flushPendingSave();
 					this.display(); // Refresh to show conditional fields if any
 				})
 			);
 		new Setting(containerEl)
 			.setName('API Key')
 			.setDesc('Transcriber API Key')
-			.addText(text => text
-				.setPlaceholder('Your API Key')
-				.setValue(this.plugin.settings.transcriber.apiKey)
-				.onChange(async (value) => {
-					this.plugin.settings.transcriber.apiKey = value;
-					await this.plugin.saveSettings();
-				})
-			);
+			.addText(text => {
+				text.inputEl.type = 'password';
+					text.setPlaceholder('Your API Key')
+						.setValue(this.plugin.settings.transcriber.apiKey)
+						.onChange((value) => {
+							this.plugin.settings.transcriber.apiKey = value;
+							this.scheduleSave();
+						});
+				});
 		new Setting(containerEl)
 			.setName('Model Name')
 			.setDesc('Specify the model to use for transcription.')
 			.addText(text => text
 				.setPlaceholder('Example: gpt-4o-transcribe')
 				.setValue(this.plugin.settings.transcriber.model)
-				.onChange(async (value) => {
+				.onChange((value) => {
 					this.plugin.settings.transcriber.model = value;
-					await this.plugin.saveSettings();
+					this.scheduleSave();
 				})
 			);
 		new Setting(containerEl)
@@ -89,9 +238,9 @@ export default class SettingsTab extends PluginSettingTab {
 			.addTextArea(textArea => textArea
 				.setPlaceholder('Clarify uncommon words or phrases in the transcript.')
 				.setValue(this.plugin.settings.transcriber.prompt)
-				.onChange(async (value) => {
+				.onChange((value) => {
 					this.plugin.settings.transcriber.prompt = value;
-					await this.plugin.saveSettings();
+					this.scheduleSave();
 				})
 			);
 		new Setting(containerEl)
@@ -100,11 +249,11 @@ export default class SettingsTab extends PluginSettingTab {
 			.addText(text => text
 				.setPlaceholder('0.0-1.0')
 				.setValue(this.plugin.settings.transcriber.temperature.toString())
-				.onChange(async (value) => {
+				.onChange((value) => {
 					const num = parseFloat(value);
 					if (!isNaN(num) && num >= 0 && num <= 1) {
 						this.plugin.settings.transcriber.temperature = num;
-						await this.plugin.saveSettings();
+						this.scheduleSave();
 					}
 				})
 			);
@@ -114,9 +263,9 @@ export default class SettingsTab extends PluginSettingTab {
 			.addText(text => text
 				.setPlaceholder('Recordings/')
 				.setValue(this.plugin.settings.transcriber.audioDir)
-				.onChange(async (value) => {
+				.onChange((value) => {
 					this.plugin.settings.transcriber.audioDir = value;
-					await this.plugin.saveSettings();
+					this.scheduleSave();
 				})
 			);
 		new Setting(containerEl)
@@ -125,9 +274,9 @@ export default class SettingsTab extends PluginSettingTab {
 			.addText(text => text
 				.setPlaceholder('Transcripts/')
 				.setValue(this.plugin.settings.transcriber.transcriptDir)
-				.onChange(async (value) => {
+				.onChange((value) => {
 					this.plugin.settings.transcriber.transcriptDir = value;
-					await this.plugin.saveSettings();
+					this.scheduleSave();
 				})
 			);
 
@@ -136,13 +285,13 @@ export default class SettingsTab extends PluginSettingTab {
 			new Setting(containerEl)
 				.setName('Gemini Upload Mode')
 				.setDesc('When enabled, audio is always converted to WAV before uploading for best transcription quality. Disable to upload original compressed audio for faster uploads.')
-				.addToggle(toggle => toggle
-					.setValue(this.plugin.settings.transcriber.preferQualityWav)
-					.onChange(async (value) => {
-						this.plugin.settings.transcriber.preferQualityWav = value;
-						await this.plugin.saveSettings();
-					})
-				);
+					.addToggle(toggle => toggle
+						.setValue(this.plugin.settings.transcriber.preferQualityWav)
+						.onChange(async (value) => {
+							this.plugin.settings.transcriber.preferQualityWav = value;
+							await this.flushPendingSave();
+						})
+					);
 		}
 
 		// Editor Settings
@@ -154,7 +303,7 @@ export default class SettingsTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.editor.enabled)
 				.onChange(async (value) => {
 					this.plugin.settings.editor.enabled = value;
-					await this.plugin.saveSettings();
+					await this.flushPendingSave();
 					this.display(); // Refresh to show/hide editor settings
 				})
 			);
@@ -169,30 +318,31 @@ export default class SettingsTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.editor.provider)
 					.onChange(async (value) => {
 						this.plugin.settings.editor.provider = value as 'openai' | 'gemini';
-						await this.plugin.saveSettings();
+						await this.flushPendingSave();
 						this.display(); // Refresh
 					})
 				);
 			new Setting(containerEl)
 				.setName('API Key')
 				.setDesc('Editor API Key')
-				.addText(text => text
-					.setPlaceholder('Your API Key.')
-					.setValue(this.plugin.settings.editor.apiKey)
-					.onChange(async (value) => {
-						this.plugin.settings.editor.apiKey = value;
-						await this.plugin.saveSettings();
-					})
-				);
+				.addText(text => {
+					text.inputEl.type = 'password';
+						text.setPlaceholder('Your API Key.')
+							.setValue(this.plugin.settings.editor.apiKey)
+							.onChange((value) => {
+								this.plugin.settings.editor.apiKey = value;
+								this.scheduleSave();
+							});
+					});
 			new Setting(containerEl)
 				.setName('Model Name')
 				.setDesc('Specify the model to use for editing.')
 				.addText(text => text
 					.setPlaceholder('Example: gemini-2.5-flash-preview-04-17')
 					.setValue(this.plugin.settings.editor.model)
-					.onChange(async (value) => {
+					.onChange((value) => {
 						this.plugin.settings.editor.model = value;
-						await this.plugin.saveSettings();
+						this.scheduleSave();
 					})
 				);
 
@@ -211,7 +361,7 @@ export default class SettingsTab extends PluginSettingTab {
 					dropdown.setValue(activeTemplateName)
 						.onChange(async (value) => {
 							this.plugin.settings.editor.activeSystemPromptTemplateName = value;
-							await this.plugin.saveSettings();
+							await this.flushPendingSave();
 							this.display(); // Re-render to update template name and prompt fields
 						});
 				});
@@ -240,7 +390,7 @@ export default class SettingsTab extends PluginSettingTab {
 								}
 								currentActiveTemplate.name = newName;
 								this.plugin.settings.editor.activeSystemPromptTemplateName = newName;
-								await this.plugin.saveSettings();
+								await this.flushPendingSave();
 								this.display(); // Re-render to update dropdown and other fields
 							} else if (newName === currentActiveTemplate.name) {
 								// If the name is the same (e.g., user clicked in and out), no need to do anything
@@ -266,9 +416,9 @@ export default class SettingsTab extends PluginSettingTab {
 					.addTextArea(textArea => {
 						textArea
 							.setValue(currentActiveTemplate.prompt)
-							.onChange(async (value) => {
+							.onChange((value) => {
 								currentActiveTemplate.prompt = value;
-								await this.plugin.saveSettings();
+								this.scheduleSave();
 							});
 						textArea.inputEl.rows = 10;
 						textArea.inputEl.style.width = '100%';
@@ -297,7 +447,7 @@ export default class SettingsTab extends PluginSettingTab {
 										.onClick(async () => {
 											this.plugin.settings.editor.systemPromptTemplates = templates.filter(t => t.name !== currentActiveTemplate.name);
 											this.plugin.settings.editor.activeSystemPromptTemplateName = 'Default'; // Fallback to Default
-											await this.plugin.saveSettings();
+											await this.flushPendingSave();
 											confirmModal.close();
 											this.display(); // Re-render
 										}));
@@ -319,11 +469,23 @@ export default class SettingsTab extends PluginSettingTab {
 								const newTemplate: SystemPromptTemplate = { name: result.name, prompt: result.prompt };
 								this.plugin.settings.editor.systemPromptTemplates.push(newTemplate);
 								this.plugin.settings.editor.activeSystemPromptTemplateName = newTemplate.name;
-								this.plugin.saveSettings().then(() => this.display());
+								this.flushPendingSave().then(() => this.display());
 							}
 						}).open();
 					})
 				);
+
+			new Setting(containerEl)
+				.setName(t('settingsTemplateImportExport'))
+				.setDesc(t('settingsTemplateImportExportDesc'))
+				.addButton(button => button
+					.setButtonText(t('settingsExportTemplates'))
+					.onClick(() => this.exportTemplates()))
+				.addButton(button => button
+					.setButtonText(t('settingsImportTemplates'))
+					.onClick(async () => {
+						await this.importTemplatesFromFile();
+					}));
 
 			// --- End of System Prompt Template Management ---
 
@@ -331,13 +493,13 @@ export default class SettingsTab extends PluginSettingTab {
 				.setName('User Prompt')
 				.setDesc('Specify user-level instructions for the editor.')
 				.addTextArea(textArea => {
-					textArea
-						.setPlaceholder('')
-						.setValue(this.plugin.settings.editor.userPrompt)
-						.onChange(async (value) => {
-							this.plugin.settings.editor.userPrompt = value;
-							await this.plugin.saveSettings();
-						});
+						textArea
+							.setPlaceholder('')
+							.setValue(this.plugin.settings.editor.userPrompt)
+							.onChange((value) => {
+								this.plugin.settings.editor.userPrompt = value;
+								this.scheduleSave();
+							});
 					textArea.inputEl.rows = 3;
 					textArea.inputEl.style.width = '100%';
 				});
@@ -347,11 +509,11 @@ export default class SettingsTab extends PluginSettingTab {
 				.addText(text => text
 					.setPlaceholder('0.0-1.0')
 					.setValue(this.plugin.settings.editor.temperature.toString())
-					.onChange(async (value) => {
+					.onChange((value) => {
 						const num = parseFloat(value);
 						if (!isNaN(num) && num >= 0 && num <= 1) {
 							this.plugin.settings.editor.temperature = num;
-							await this.plugin.saveSettings();
+							this.scheduleSave();
 						}
 					})
 				);
@@ -362,7 +524,7 @@ export default class SettingsTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.editor.keepOriginal)
 					.onChange(async (value) => {
 						this.plugin.settings.editor.keepOriginal = value;
-						await this.plugin.saveSettings();
+						await this.flushPendingSave();
 					})
 				);
 		}
@@ -384,6 +546,7 @@ class NewTemplateModal extends Modal {
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
+		contentEl.addClass('ai-transcriber-template-editor-modal');
 		contentEl.createEl('h2', { text: 'Create New System Prompt Template' });
 
 		let newName = 'New Template';

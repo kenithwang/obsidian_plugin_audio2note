@@ -10,9 +10,9 @@ export class RecorderService {
 	private startTime = 0;
 	private pauseTime = 0;
 	private totalPausedTime = 0;
-	private resolveStop: (result: RecordingResult) => void;
-	private rejectStop: (reason?: unknown) => void;
-	private stopPromise: Promise<RecordingResult>;
+	private resolveStop: ((result: RecordingResult) => void) | null = null;
+	private rejectStop: ((reason?: unknown) => void) | null = null;
+	private stopPromise: Promise<RecordingResult> | null = null;
 	private stream: MediaStream | null = null;
 	// 音频分析相关属性
 	private audioContext: AudioContext | null = null;
@@ -122,6 +122,9 @@ export class RecorderService {
 
 	async stop(): Promise<RecordingResult> {
 		console.info('[AI Transcriber] Stopping recording...');
+		if (!this.stopPromise) {
+			throw new Error('Cannot stop: recording has not been started');
+		}
 		// 停止音频分析
 		if (this.animationFrameId) {
 			cancelAnimationFrame(this.animationFrameId);
@@ -152,6 +155,9 @@ export class RecorderService {
 		// Reset recorder and stream for next recording
 		this.mediaRecorder = null;
 		this.stream = null;
+		this.resolveStop = null;
+		this.rejectStop = null;
+		this.stopPromise = null;
 		// Reset timing state
 		this.startTime = 0;
 		this.pauseTime = 0;

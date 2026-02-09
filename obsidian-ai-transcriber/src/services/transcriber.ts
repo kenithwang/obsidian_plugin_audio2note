@@ -1,474 +1,1033 @@
-import OpenAI from "openai";
+import OpenAI from 'openai';
+import { TranscriberSettings } from '../settings/types';
+
+const TARGET_SAMPLE_RATE = 16000;
+const SILENCE_THRESHOLD = 0.01;
+const SILENCE_WINDOW_SECONDS = 0.3;
+const SEARCH_RANGE_SECONDS = 5;
+const MIN_CHUNK_SECONDS = 1;
+const DEFAULT_TRANSCRIBE_CONCURRENCY = 3;
+const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
+const DIRECT_GEMINI_UPLOAD_MAX_BYTES = 20 * 1024 * 1024;
+
+type TranscriptionStage = 'preprocess' | 'upload' | 'processing' | 'transcribe' | 'done';
+
+export interface TranscriptionProgress {
+	provider: 'openai' | 'gemini';
+	stage: TranscriptionStage;
+	currentChunk?: number;
+	totalChunks?: number;
+	completedChunks?: number;
+}
+
+export interface TranscribeOptions {
+	context?: string;
+	signal?: AbortSignal;
+	onProgress?: (progress: TranscriptionProgress) => void;
+}
+
+interface WorkerPreprocessOptions {
+	trimLongSilence: boolean;
+	minSilenceTrimSamples: number;
+	maxDurationSeconds: number;
+	targetSampleRate: number;
+	silenceThreshold: number;
+	silenceWindowSeconds: number;
+	searchRangeSeconds: number;
+	minChunkSeconds: number;
+}
+
+interface RetryOptions {
+	label: string;
+	signal?: AbortSignal;
+	maxRetries?: number;
+}
 
 export class TranscriberService {
+	private openAIClients = new Map<string, OpenAI>();
+	private decodeAudioCtx: AudioContext | null = null;
+	private static audioWorkerUrl: string | null = null;
+
+	public async dispose(): Promise<void> {
+		if (this.decodeAudioCtx && this.decodeAudioCtx.state !== 'closed') {
+			await this.decodeAudioCtx.close();
+		}
+		this.decodeAudioCtx = null;
+	}
+
 	/**
 	 * Transcribe audio blob using OpenAI or Gemini API based on settings.
-	 * @param blob Audio blob to transcribe
-	 * @param settings TranscriberSettings from plugin configuration
+	 * Supports cancellation and progress updates.
 	 */
 	async transcribe(
 		blob: Blob,
-		settings: import('../settings/types').TranscriberSettings,
-		context?: string
+		settings: TranscriberSettings,
+		contextOrOptions?: string | TranscribeOptions
 	): Promise<string> {
+		const options = this.normalizeOptions(contextOrOptions);
+
 		if (!settings.apiKey) {
 			throw new Error('Transcriber API key is not configured');
 		}
+
 		console.info('[AI Transcriber] Transcription requested.', {
 			provider: settings.provider,
 			model: settings.model,
 			mimeType: blob.type || 'unknown',
 			sizeBytes: blob.size,
 		});
-		// Handle OpenAI transcription
+
+		this.throwIfAborted(options.signal);
+
 		if (settings.provider === 'openai') {
-			// Use OpenAI SDK for transcription
-			// OpenAI Whisper 有 25MB 限制，需要分块
-			const openai = new OpenAI({ apiKey: settings.apiKey, dangerouslyAllowBrowser: true });
-			console.info('[AI Transcriber] OpenAI preprocess start.');
-			const chunks = await this.preprocess(blob);
-			console.info('[AI Transcriber] OpenAI preprocess done.', { chunks: chunks.length, chunkBytes: chunks.map(c => c.size) });
-			let fullText = '';
-			let idx = 0;
-			for (const chunk of chunks) {
-				idx++;
-				console.info(`[AI Transcriber] OpenAI transcribing chunk ${idx}/${chunks.length}...`, { sizeBytes: chunk.size });
-				let prompt = settings.prompt || '';
-				if (context && context.trim()) {
-					const contextBlock =
-						'【用户提供的会议背景（仅用于提高识别准确性）】\n' +
-						context.trim() +
-						'\n【使用规则】\n- 仅用于人名/组织/术语识别\n- 不要添加音频中未出现的内容';
-					prompt = prompt ? `${prompt}\n\n${contextBlock}` : contextBlock;
-				}
-				const transcription = await openai.audio.transcriptions.create({
-					file: new File([chunk], 'audio.wav', { type: 'audio/wav' }),
-					model: settings.model,
-					response_format: 'text',
-					...(prompt ? { prompt } : {}),
-				});
-				if (fullText) fullText += '\n';
-				fullText += transcription;
-			}
-			console.info('[AI Transcriber] OpenAI transcription complete.', { textLength: fullText.length });
-			return fullText;
+			return this.transcribeWithOpenAI(blob, settings, options);
 		}
 
-		// Handle Gemini transcription using File API
-		// Gemini File API 支持最长 9.5 小时，但保险起见超过 8 小时就分块
 		if (settings.provider === 'gemini') {
-			const { GoogleGenAI } = await import('@google/genai');
-			const genAI = new GoogleGenAI({ apiKey: settings.apiKey });
-
-			// Prefer uploading the original (already compressed) audio when possible.
-			// Fall back to preprocessing/chunking only for very large files.
-			const MAX_UPLOAD_BYTES = 90 * 1024 * 1024; // Keep below 100MB File API limit
-			const MAX_DURATION_SECONDS = 15 * 60; // 15 分钟，降低漏转风险
-			const preferQualityWav = settings.preferQualityWav;
-			const useDirectUpload = false;
-			console.info('[AI Transcriber] Gemini path selected (direct upload disabled).', {
-				useDirectUpload,
-				preferQualityWav,
-				thresholdBytes: MAX_UPLOAD_BYTES,
-			});
-			const chunks = useDirectUpload
-				? [blob]
-				: await this.preprocessForGemini(blob, MAX_DURATION_SECONDS);
-			console.info('[AI Transcriber] Gemini chunks ready.', { chunks: chunks.length, chunkBytes: chunks.map(c => c.size), mimeTypes: chunks.map(c => c.type || 'unknown') });
-
-			let fullText = '';
-			let idx = 0;
-			for (const chunk of chunks) {
-				idx++;
-				const mimeType = chunk.type || 'audio/webm';
-				// 使用 File API 上传音频
-				console.info(`[AI Transcriber] Gemini uploading chunk ${idx}/${chunks.length}...`, { mimeType, sizeBytes: chunk.size });
-				const uploadStart = Date.now();
-				let file = await genAI.files.upload({
-					file: chunk,
-					config: { mimeType }
-				});
-				console.info('[AI Transcriber] Gemini upload done.', { ms: Date.now() - uploadStart, uri: file?.uri, state: file?.state });
-
-				if (!file?.uri) {
-					throw new Error('Gemini File API upload failed: no file URI returned');
-				}
-
-				// 等待文件处理完成
-				let lastLog = Date.now();
-				while (file.state === 'PROCESSING') {
-					await new Promise(resolve => setTimeout(resolve, 1000));
-					file = await genAI.files.get({ name: file.name! });
-					if (Date.now() - lastLog >= 5000) {
-						console.info('[AI Transcriber] Gemini file still processing...', { name: file.name, state: file.state });
-						lastLog = Date.now();
-					}
-				}
-
-				if (file.state === 'FAILED') {
-					throw new Error('Gemini file processing failed');
-				}
-				console.info('[AI Transcriber] Gemini file processing complete.', { name: file.name, state: file.state });
-
-				// 使用文件 URI 进行转录
-				console.info(`[AI Transcriber] Gemini generating content for chunk ${idx}/${chunks.length}...`);
-
-				// Enhanced prompt to emphasize completeness
-				let enhancedPrompt = settings.prompt ||
-					'You are a professional multilingual transcriber. Your task is to transcribe the audio file VERBATIM (word-for-word) into text.\n\n' +
-					'**CRITICAL REQUIREMENTS:**\n' +
-					'- **TRANSCRIBE THE ENTIRE AUDIO FROM START TO FINISH.** Do NOT skip, truncate, or omit any part.\n' +
-					'- **DO NOT SUMMARIZE.** Every single word must be transcribed.\n' +
-					'- **OUTPUT MUST BE IN THE SAME LANGUAGE AS SPOKEN IN THE AUDIO.** NEVER translate to any other language.\n' +
-					'- If the audio is long, you MUST continue transcribing until the very end. Never stop early.\n\n' +
-					'**GUIDELINES:**\n' +
-					'1. **Languages:** The audio may contain **Mandarin Chinese**, **English**, and/or **Japanese**.\n' +
-					'   - Transcribe exactly as spoken in the original language.\n' +
-					'   - **DO NOT TRANSLATE.** (e.g., If spoken in English, write in English; if in Japanese, write in Japanese Kanji/Kana).\n' +
-					'2. **Speaker Identification:** Identify different speakers. Label them as "**Speaker 1:**", "**Speaker 2:**", etc. Start a new paragraph every time the speaker changes.\n' +
-					'3. **Accuracy:** Do not correct grammar. Do not paraphrase. Include every detail, every word, every sentence.\n' +
-					'4. **Format:** Output plain text with clear paragraph breaks.\n' +
-					'5. **Noise:** Ignore non-speech sounds (like [laughter], [silence], [typing sounds]).\n\n' +
-					'Begin transcription now and continue until the audio ends.';
-				if (context && context.trim()) {
-					enhancedPrompt +=
-						'\n\n【用户提供的会议背景（仅用于提高识别准确性）】\n' +
-						context.trim() +
-						'\n【使用规则】\n- 仅用于人名/组织/术语识别\n- 不要添加音频中未出现的内容';
-				}
-
-				const response = await genAI.models.generateContent({
-					model: settings.model,
-					contents: [{
-						role: 'user',
-						parts: [
-									{ text: enhancedPrompt },
-									{ fileData: { fileUri: file.uri!, mimeType } }
-								]
-							}],
-					config: {
-						temperature: settings.temperature,
-						maxOutputTokens: 65536  // Critical: Large token limit to prevent truncation
-					}
-				});
-
-				const result = response.text;
-
-				// 清理上传的文件
-				try {
-					await genAI.files.delete({ name: file.name! });
-				} catch (e) {
-					console.warn('Failed to delete uploaded file:', e);
-				}
-
-				if (typeof result !== 'string') {
-					throw new Error('Gemini Transcription error: No text content in response');
-				}
-
-				if (fullText) fullText += '\n';
-				fullText += result;
-			}
-
-			console.info('[AI Transcriber] Gemini transcription complete.', { textLength: fullText.length });
-			return fullText;
+			return this.transcribeWithGemini(blob, settings, options);
 		}
 
 		throw new Error(`Unsupported transcription provider: ${settings.provider}`);
 	}
 
-	/**
-	 * Gemini 专用预处理：重采样，不做静音裁剪，仅在静音处切分，超过 maxDurationSeconds 则分块。
-	 * 仅在原始音频过大时使用此路径。
-	 */
-	private async preprocessForGemini(blob: Blob, maxDurationSeconds: number): Promise<Blob[]> {
-		console.info('[AI Transcriber] Gemini preprocess (WAV chunking) start.', { maxDurationSeconds, sizeBytes: blob.size });
-		const TARGET_SAMPLE_RATE = 16000;
-		const SILENCE_THRESHOLD = 0.01;
-		const CHUNK_SPLIT_SILENCE_WINDOW_SECONDS = 0.3;
-		const CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES = Math.floor(CHUNK_SPLIT_SILENCE_WINDOW_SECONDS * TARGET_SAMPLE_RATE);
-		const CHUNK_SPLIT_SEARCH_RANGE_SECONDS = 5;
-		const CHUNK_SPLIT_SEARCH_RANGE_SAMPLES = Math.floor(CHUNK_SPLIT_SEARCH_RANGE_SECONDS * TARGET_SAMPLE_RATE);
-		const MIN_CHUNK_SAMPLES = TARGET_SAMPLE_RATE; // 最短 1 秒
-
-		const arrayBuffer = await blob.arrayBuffer();
-		const AudioContextConstructor = window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-		if (!AudioContextConstructor) {
-			throw new Error("Web Audio API is not supported in this browser.");
+	private normalizeOptions(contextOrOptions?: string | TranscribeOptions): TranscribeOptions {
+		if (typeof contextOrOptions === 'string') {
+			return { context: contextOrOptions };
 		}
-		const decodeCtx = new AudioContextConstructor();
-		const originalBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
-		await decodeCtx.close();
-
-		const targetLength = Math.ceil(originalBuffer.duration * TARGET_SAMPLE_RATE);
-		const offlineCtx = new OfflineAudioContext(1, targetLength, TARGET_SAMPLE_RATE);
-		const source = offlineCtx.createBufferSource();
-
-		if (originalBuffer.numberOfChannels > 1) {
-			const numChannels = originalBuffer.numberOfChannels;
-			const monoBuf = offlineCtx.createBuffer(1, originalBuffer.length, originalBuffer.sampleRate);
-			const monoData = monoBuf.getChannelData(0);
-			const channels = [];
-			for (let c = 0; c < numChannels; c++) {
-				channels.push(originalBuffer.getChannelData(c));
-			}
-			for (let i = 0; i < originalBuffer.length; i++) {
-				let sum = 0;
-				for (let c = 0; c < numChannels; c++) {
-					sum += channels[c][i];
-				}
-				monoData[i] = sum / numChannels;
-			}
-			source.buffer = monoBuf;
-		} else {
-			source.buffer = originalBuffer;
-		}
-		source.connect(offlineCtx.destination);
-		source.start();
-		const resampled = await offlineCtx.startRendering();
-
-		// 不做静音裁剪，保留全部内容，仅用于后续静音处切分
-		const data = resampled.getChannelData(0);
-
-		// 分块逻辑（如果超过 maxDurationSeconds）
-		const maxSamples = maxDurationSeconds * TARGET_SAMPLE_RATE;
-		const totalSamples = data.length;
-		const chunks: Blob[] = [];
-		const audioCtx = new AudioContextConstructor();
-
-		let startSample = 0;
-		while (startSample < totalSamples) {
-			let endSample = Math.min(startSample + maxSamples, totalSamples);
-
-			// 如果不是最后一块，尝试在静音处切分
-			if (endSample < totalSamples) {
-				let splitPoint: number | null = null;
-				const desiredSplit = endSample;
-
-				// 向后搜索静音点
-				const backwardStart = Math.max(CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES, desiredSplit - CHUNK_SPLIT_SEARCH_RANGE_SAMPLES);
-				for (let i = desiredSplit; i >= backwardStart; i--) {
-					let silent = true;
-					for (let j = i - CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES; j < i; j++) {
-						if (Math.abs(data[j]) > SILENCE_THRESHOLD) { silent = false; break; }
-					}
-					if (silent) { splitPoint = i - CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES; break; }
-				}
-
-				// 向前搜索静音点
-				if (splitPoint === null) {
-					const forwardEnd = Math.min(totalSamples, desiredSplit + CHUNK_SPLIT_SEARCH_RANGE_SAMPLES);
-					for (let i = desiredSplit; i < forwardEnd; i++) {
-						let silent = true;
-						for (let j = i; j < i + CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES && j < totalSamples; j++) {
-							if (Math.abs(data[j]) > SILENCE_THRESHOLD) { silent = false; break; }
-						}
-						if (silent) { splitPoint = i; break; }
-					}
-				}
-
-				if (splitPoint !== null && splitPoint > startSample) {
-					endSample = splitPoint;
-				}
-			}
-
-			const segmentSamples = endSample - startSample;
-			if (segmentSamples >= MIN_CHUNK_SAMPLES) {
-				const buffer = audioCtx.createBuffer(1, segmentSamples, TARGET_SAMPLE_RATE);
-				buffer.getChannelData(0).set(data.subarray(startSample, endSample));
-				chunks.push(this.bufferToWav(buffer));
-			}
-
-			startSample = endSample;
-		}
-
-		await audioCtx.close();
-		console.info('[AI Transcriber] Gemini preprocess done.', { chunks: chunks.length, chunkBytes: chunks.map(c => c.size) });
-		return chunks;
+		return contextOrOptions ?? {};
 	}
 
-	// Preprocess audio: decode, resample to 16k mono and chunk into ≤10min WAV blobs
-	private async preprocess(blob: Blob, maxSecsInput?: number): Promise<Blob[]> {
-		console.info('[AI Transcriber] OpenAI preprocess (WAV chunking) start.', { maxSecsInput, sizeBytes: blob.size });
-		const TARGET_SAMPLE_RATE = 16000;
-		const MAX_CHUNK_SECONDS = maxSecsInput ?? 600; // Default to 10 minutes (600s) if not provided
-		const SILENCE_THRESHOLD = 0.01;
-		const MIN_SILENCE_DURATION_SECONDS = 2;
-		const MIN_SILENCE_TRIM_SAMPLES = Math.floor(MIN_SILENCE_DURATION_SECONDS * TARGET_SAMPLE_RATE);
-		const CHUNK_SPLIT_SILENCE_WINDOW_SECONDS = 0.3;
-		const CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES = Math.floor(CHUNK_SPLIT_SILENCE_WINDOW_SECONDS * TARGET_SAMPLE_RATE);
-		const CHUNK_SPLIT_SEARCH_RANGE_SECONDS = 5;
-		const CHUNK_SPLIT_SEARCH_RANGE_SAMPLES = Math.floor(CHUNK_SPLIT_SEARCH_RANGE_SECONDS * TARGET_SAMPLE_RATE);
-		const MIN_CHUNK_DURATION_SECONDS = 1;
-		const MIN_CHUNK_SAMPLES = Math.floor(MIN_CHUNK_DURATION_SECONDS * TARGET_SAMPLE_RATE);
-
-
-		const arrayBuffer = await blob.arrayBuffer();
-		const AudioContextConstructor = window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-		if (!AudioContextConstructor) {
-			throw new Error("Web Audio API is not supported in this browser.");
-		}
-		const decodeCtx = new AudioContextConstructor();
-		const originalBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
-		// 解码完成后关闭 AudioContext 释放资源
-		await decodeCtx.close();
-		
-		const targetLength = Math.ceil(originalBuffer.duration * TARGET_SAMPLE_RATE);
-		const offlineCtx = new OfflineAudioContext(1, targetLength, TARGET_SAMPLE_RATE);
-		const source = offlineCtx.createBufferSource();
-
-		if (originalBuffer.numberOfChannels > 1) {
-			const numChannels = originalBuffer.numberOfChannels;
-			const monoBuf = offlineCtx.createBuffer(1, originalBuffer.length, originalBuffer.sampleRate);
-			const monoData = monoBuf.getChannelData(0);
-			const channels = [];
-			for (let c = 0; c < numChannels; c++) {
-				channels.push(originalBuffer.getChannelData(c));
-			}
-			for (let i = 0; i < originalBuffer.length; i++) {
-				let sum = 0;
-				for (let c = 0; c < numChannels; c++) {
-					sum += channels[c][i];
-				}
-				monoData[i] = sum / numChannels;
-			}
-			source.buffer = monoBuf;
-		} else {
-			source.buffer = originalBuffer;
-		}
-		source.connect(offlineCtx.destination);
-		source.start();
-		const resampled = await offlineCtx.startRendering();
-		// Silence trimming: remove continuous silent segments longer than MIN_SILENCE_DURATION_SECONDS
-		const rawData = resampled.getChannelData(0);
-		// const silenceThreshold = 0.01; // Replaced by SILENCE_THRESHOLD
-		// const minSilenceTrimSamples = Math.floor(2 * TARGET_SAMPLE_RATE); // Replaced by MIN_SILENCE_TRIM_SAMPLES
-
-		// Optimized silence trimming to avoid large intermediate arrays
-		let samplesToKeep = 0;
-		let currentSilentCountForCounting = 0;
-		for (let i = 0; i < rawData.length; i++) {
-			const sample = rawData[i];
-			if (Math.abs(sample) <= SILENCE_THRESHOLD) {
-				currentSilentCountForCounting++;
-			} else {
-				if (currentSilentCountForCounting > 0 && currentSilentCountForCounting < MIN_SILENCE_TRIM_SAMPLES) {
-					samplesToKeep += currentSilentCountForCounting; // Keep the short silence
-				}
-				currentSilentCountForCounting = 0;
-				samplesToKeep++; // Keep the current non-silent sample
-			}
-		}
-		// Note: Trailing silence (short or long) is implicitly dropped by this logic,
-		// matching the original behavior where the loop ended without adding trailing short silence.
-
-		const data = new Float32Array(samplesToKeep);
-		let currentIndex = 0;
-		let currentSilentCountForFilling = 0;
-		for (let i = 0; i < rawData.length; i++) {
-			const sample = rawData[i];
-			if (Math.abs(sample) <= SILENCE_THRESHOLD) {
-				currentSilentCountForFilling++;
-			} else {
-				if (currentSilentCountForFilling > 0 && currentSilentCountForFilling < MIN_SILENCE_TRIM_SAMPLES) {
-					for (let j = i - currentSilentCountForFilling; j < i; j++) {
-						data[currentIndex++] = rawData[j];
-					}
-				}
-				currentSilentCountForFilling = 0;
-				data[currentIndex++] = sample;
-			}
-		}
-		// `data` is now the trimmed Float32Array
-
-		const maxSamples = MAX_CHUNK_SECONDS * TARGET_SAMPLE_RATE;
-		const totalSamples = data.length;
-		// const silenceWindowSamples = Math.floor(0.3 * TARGET_SAMPLE_RATE); // Replaced by CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES
-		// const searchRangeSamples = Math.floor(5 * TARGET_SAMPLE_RATE);      // Replaced by CHUNK_SPLIT_SEARCH_RANGE_SAMPLES
-		const audioCtxForChunking = new AudioContextConstructor(); // Use the same constructor for consistency
-		const chunks: Blob[] = [];
-		let startSample = 0;
-		// const minChunkSamples = TARGET_SAMPLE_RATE; // discard segments shorter than 1s - Replaced by MIN_CHUNK_SAMPLES
-		while (startSample < totalSamples) {
-			let endSample = Math.min(startSample + maxSamples, totalSamples);
-			if (endSample < totalSamples) {
-				let splitPoint: number | null = null;
-				const desiredSplit = endSample;
-				// search backward for a silent region
-				const backwardStart = Math.max(CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES, desiredSplit - CHUNK_SPLIT_SEARCH_RANGE_SAMPLES);
-				for (let i = desiredSplit; i >= backwardStart; i--) {
-					let silent = true;
-					for (let j = i - CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES; j < i; j++) {
-						if (Math.abs(data[j]) > SILENCE_THRESHOLD) { silent = false; break; }
-					}
-					if (silent) { splitPoint = i - CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES; break; }
-				}
-				// if no silent point before, search forward
-				if (splitPoint === null) {
-					const forwardEnd = Math.min(totalSamples, desiredSplit + CHUNK_SPLIT_SEARCH_RANGE_SAMPLES);
-					for (let i = desiredSplit; i < forwardEnd; i++) {
-						let silent = true;
-						for (let j = i; j < i + CHUNK_SPLIT_SILENCE_WINDOW_SAMPLES && j < totalSamples; j++) {
-							if (Math.abs(data[j]) > SILENCE_THRESHOLD) { silent = false; break; }
-						}
-						if (silent) { splitPoint = i; break; }
-					}
-				}
-				if (splitPoint !== null && splitPoint > startSample) {
-					endSample = splitPoint;
-				}
-			}
-			const segmentBuf = audioCtxForChunking.createBuffer(1, endSample - startSample, TARGET_SAMPLE_RATE);
-			segmentBuf.getChannelData(0).set(data.subarray(startSample, endSample));
-			const segmentSamples = endSample - startSample;
-			if (segmentSamples >= MIN_CHUNK_SAMPLES) {
-				chunks.push(this.bufferToWav(segmentBuf));
-			}
-			startSample = endSample;
-		}
-		// 分块完成后关闭 AudioContext 释放资源
-		await audioCtxForChunking.close();
-		console.info('[AI Transcriber] OpenAI preprocess done.', { chunks: chunks.length, chunkBytes: chunks.map(c => c.size) });
-		return chunks;
+	private emitProgress(options: TranscribeOptions, progress: TranscriptionProgress): void {
+		options.onProgress?.(progress);
 	}
 
-	private bufferToWav(buffer: AudioBuffer): Blob {
-		const numOfChannels = buffer.numberOfChannels;
-		const sampleRate = buffer.sampleRate;
-		const bitDepth = 16;
-		const blockAlign = numOfChannels * (bitDepth / 8);
-		const dataSize = buffer.length * blockAlign;
-		const bufferArray = new ArrayBuffer(44 + dataSize);
-		const view = new DataView(bufferArray);
+	private throwIfAborted(signal?: AbortSignal): void {
+		if (signal?.aborted) {
+			throw this.createAbortError();
+		}
+	}
 
-		const writeString = (str: string, offset: number) => {
-			for (let i = 0; i < str.length; i++) {
-				view.setUint8(offset + i, str.charCodeAt(i));
+	private createAbortError(): Error {
+		try {
+			return new DOMException('The operation was aborted.', 'AbortError');
+		} catch {
+			const err = new Error('The operation was aborted.');
+			err.name = 'AbortError';
+			return err;
+		}
+	}
+
+	private isAbortError(error: unknown): boolean {
+		return (
+			(error as Error)?.name === 'AbortError' ||
+			((error as Error)?.message ?? '').toLowerCase().includes('aborted')
+		);
+	}
+
+	private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+		if (!signal) {
+			await new Promise(resolve => setTimeout(resolve, ms));
+			return;
+		}
+		await new Promise<void>((resolve, reject) => {
+			if (signal.aborted) {
+				reject(this.createAbortError());
+				return;
+			}
+			const timer = window.setTimeout(() => {
+				signal.removeEventListener('abort', onAbort);
+				resolve();
+			}, ms);
+			const onAbort = () => {
+				window.clearTimeout(timer);
+				signal.removeEventListener('abort', onAbort);
+				reject(this.createAbortError());
+			};
+			signal.addEventListener('abort', onAbort);
+		});
+	}
+
+	private async withRetries<T>(operation: () => Promise<T>, options: RetryOptions): Promise<T> {
+		const maxRetries = options.maxRetries ?? 3;
+		let lastError: unknown;
+
+		for (let attempt = 1; attempt <= maxRetries; attempt++) {
+			this.throwIfAborted(options.signal);
+			try {
+				return await operation();
+			} catch (error) {
+				lastError = error;
+				if (this.isAbortError(error)) {
+					throw error;
+				}
+				if (attempt >= maxRetries) {
+					break;
+				}
+				console.warn(`[AI Transcriber] ${options.label} failed (attempt ${attempt}/${maxRetries}). Retrying...`, error);
+				await this.sleep(500 * Math.pow(2, attempt - 1), options.signal);
+			}
+		}
+
+		throw new Error(
+			`[AI Transcriber] ${options.label} failed after ${maxRetries} attempts: ${
+				(lastError as Error)?.message ?? 'Unknown error'
+			}`,
+		);
+	}
+
+	private async mapWithConcurrency<T, R>(
+		items: T[],
+		concurrency: number,
+		signal: AbortSignal | undefined,
+		worker: (item: T, index: number, workerSignal?: AbortSignal) => Promise<R>,
+	): Promise<R[]> {
+		const limitedConcurrency = Math.max(1, Math.min(concurrency, items.length || 1));
+		const results = new Array<R>(items.length);
+		if (!items.length) {
+			return results;
+		}
+
+		const localAbortController = new AbortController();
+		const merged = this.mergeAbortSignals(signal, localAbortController.signal);
+		let nextIndex = 0;
+		let firstError: unknown;
+
+		const runners = Array.from({ length: limitedConcurrency }, async () => {
+			while (true) {
+				this.throwIfAborted(merged.signal);
+				const index = nextIndex++;
+				if (index >= items.length) return;
+				try {
+					results[index] = await worker(items[index], index, merged.signal);
+				} catch (error) {
+					if (firstError === undefined) {
+						firstError = error;
+						localAbortController.abort();
+					}
+					throw error;
+				}
+			}
+		});
+
+		try {
+			await Promise.all(runners);
+			return results;
+		} catch (error) {
+			throw firstError ?? error;
+		} finally {
+			merged.cleanup();
+		}
+	}
+
+	private mergeAbortSignals(
+		primary?: AbortSignal,
+		secondary?: AbortSignal,
+	): { signal?: AbortSignal; cleanup: () => void } {
+		if (!primary) return { signal: secondary, cleanup: () => {} };
+		if (!secondary) return { signal: primary, cleanup: () => {} };
+
+		const mergedController = new AbortController();
+		const onAbort = () => {
+			if (!mergedController.signal.aborted) {
+				mergedController.abort();
 			}
 		};
 
-		writeString('RIFF', 0);
+		primary.addEventListener('abort', onAbort);
+		secondary.addEventListener('abort', onAbort);
+		if (primary.aborted || secondary.aborted) {
+			mergedController.abort();
+		}
+
+		return {
+			signal: mergedController.signal,
+			cleanup: () => {
+				primary.removeEventListener('abort', onAbort);
+				secondary.removeEventListener('abort', onAbort);
+			},
+		};
+	}
+
+	private getOpenAIClient(apiKey: string): OpenAI {
+		const cached = this.openAIClients.get(apiKey);
+		if (cached) return cached;
+		const client = new OpenAI({
+			apiKey,
+			dangerouslyAllowBrowser: true,
+		});
+		this.openAIClients.set(apiKey, client);
+		return client;
+	}
+
+	private getDecodeAudioContext(): AudioContext {
+		const AudioCtx = window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+		if (!AudioCtx) {
+			throw new Error('Web Audio API is not supported in this browser.');
+		}
+		if (!this.decodeAudioCtx || this.decodeAudioCtx.state === 'closed') {
+			this.decodeAudioCtx = new AudioCtx();
+		}
+		return this.decodeAudioCtx;
+	}
+
+	private async transcribeWithOpenAI(
+		blob: Blob,
+		settings: TranscriberSettings,
+		options: TranscribeOptions,
+	): Promise<string> {
+		const openai = this.getOpenAIClient(settings.apiKey);
+
+		this.emitProgress(options, { provider: 'openai', stage: 'preprocess' });
+		const chunks = await this.preprocess(blob, undefined, options);
+		console.info('[AI Transcriber] OpenAI preprocess done.', {
+			chunks: chunks.length,
+			chunkBytes: chunks.map(chunk => chunk.size),
+		});
+
+		if (!chunks.length) {
+			return '';
+		}
+
+		let completedChunks = 0;
+		const results = await this.mapWithConcurrency(
+			chunks,
+			DEFAULT_TRANSCRIBE_CONCURRENCY,
+			options.signal,
+			async (chunk, index, workerSignal) => {
+				this.emitProgress(options, {
+					provider: 'openai',
+					stage: 'transcribe',
+					currentChunk: index + 1,
+					totalChunks: chunks.length,
+				});
+
+				const transcription = await this.withRetries(
+					async () => {
+						this.throwIfAborted(workerSignal);
+						let prompt = settings.prompt || '';
+						if (options.context && options.context.trim()) {
+							const contextBlock =
+								'【用户提供的会议背景（仅用于提高识别准确性）】\n' +
+								options.context.trim() +
+								'\n【使用规则】\n- 仅用于人名/组织/术语识别\n- 不要添加音频中未出现的内容';
+							prompt = prompt ? `${prompt}\n\n${contextBlock}` : contextBlock;
+						}
+
+						return await openai.audio.transcriptions.create(
+							{
+								file: new File([chunk], 'audio.wav', { type: 'audio/wav' }),
+								model: settings.model,
+								response_format: 'text',
+								...(prompt ? { prompt } : {}),
+							},
+							{
+								signal: workerSignal,
+							},
+						);
+					},
+					{
+						label: `OpenAI chunk ${index + 1}/${chunks.length}`,
+						signal: workerSignal,
+					},
+				);
+
+				completedChunks++;
+				this.emitProgress(options, {
+					provider: 'openai',
+					stage: 'transcribe',
+					currentChunk: index + 1,
+					totalChunks: chunks.length,
+					completedChunks,
+				});
+				return transcription;
+			},
+		);
+
+		const fullText = results.join('\n').trim();
+		this.emitProgress(options, { provider: 'openai', stage: 'done', totalChunks: chunks.length, completedChunks });
+		console.info('[AI Transcriber] OpenAI transcription complete.', { textLength: fullText.length });
+		return fullText;
+	}
+
+	private async transcribeWithGemini(
+		blob: Blob,
+		settings: TranscriberSettings,
+		options: TranscribeOptions,
+	): Promise<string> {
+		const { GoogleGenAI } = await import('@google/genai');
+		const genAI = new GoogleGenAI({ apiKey: settings.apiKey });
+
+		const MAX_DURATION_SECONDS = 15 * 60;
+		const forceWavPreprocess = settings.preferQualityWav || blob.size > DIRECT_GEMINI_UPLOAD_MAX_BYTES;
+
+		let chunks: Blob[];
+		if (forceWavPreprocess) {
+			this.emitProgress(options, { provider: 'gemini', stage: 'preprocess' });
+			chunks = await this.preprocessForGemini(blob, MAX_DURATION_SECONDS, options);
+		} else {
+			chunks = [blob];
+		}
+
+		console.info('[AI Transcriber] Gemini chunks ready.', {
+			chunks: chunks.length,
+			chunkBytes: chunks.map(chunk => chunk.size),
+			mimeTypes: chunks.map(chunk => chunk.type || 'unknown'),
+		});
+
+		if (!chunks.length) {
+			return '';
+		}
+
+		let completedChunks = 0;
+		const results = await this.mapWithConcurrency(
+			chunks,
+			2,
+			options.signal,
+			async (chunk, index, workerSignal) => {
+				const chunkIndex = index + 1;
+				const mimeType = chunk.type || 'audio/webm';
+				let uploadedFile: { name?: string; uri?: string; state?: string } | null = null;
+
+				try {
+					this.emitProgress(options, {
+						provider: 'gemini',
+						stage: 'upload',
+						currentChunk: chunkIndex,
+						totalChunks: chunks.length,
+					});
+
+					uploadedFile = await this.withRetries(
+						async () => {
+							this.throwIfAborted(workerSignal);
+							return await genAI.files.upload({
+								file: chunk,
+								config: {
+									mimeType,
+									abortSignal: workerSignal,
+								},
+							});
+						},
+						{
+							label: `Gemini upload chunk ${chunkIndex}/${chunks.length}`,
+							signal: workerSignal,
+						},
+					);
+
+					if (!uploadedFile?.name || !uploadedFile?.uri) {
+						throw new Error('Gemini File API upload failed: no file URI returned');
+					}
+
+					uploadedFile = await this.waitForGeminiFileReady(genAI, uploadedFile, chunkIndex, chunks.length, {
+						...options,
+						signal: workerSignal,
+					});
+
+					this.emitProgress(options, {
+						provider: 'gemini',
+						stage: 'transcribe',
+						currentChunk: chunkIndex,
+						totalChunks: chunks.length,
+					});
+
+					const result = await this.withRetries(
+						async () => {
+							this.throwIfAborted(workerSignal);
+							let enhancedPrompt =
+								settings.prompt ||
+								'You are a professional multilingual transcriber. Your task is to transcribe the audio file VERBATIM (word-for-word) into text.\n\n' +
+									'**CRITICAL REQUIREMENTS:**\n' +
+									'- **TRANSCRIBE THE ENTIRE AUDIO FROM START TO FINISH.** Do NOT skip, truncate, or omit any part.\n' +
+									'- **DO NOT SUMMARIZE.** Every single word must be transcribed.\n' +
+									'- **OUTPUT MUST BE IN THE SAME LANGUAGE AS SPOKEN IN THE AUDIO.** NEVER translate to any other language.\n' +
+									'- If the audio is long, you MUST continue transcribing until the very end. Never stop early.\n\n' +
+									'**GUIDELINES:**\n' +
+									'1. **Languages:** The audio may contain **Mandarin Chinese**, **English**, and/or **Japanese**.\n' +
+									'   - Transcribe exactly as spoken in the original language.\n' +
+									'   - **DO NOT TRANSLATE.**\n' +
+									'2. **Speaker Identification:** Identify different speakers. Label them as "**Speaker 1:**", "**Speaker 2:**", etc. Start a new paragraph every time the speaker changes.\n' +
+									'3. **Accuracy:** Do not correct grammar. Do not paraphrase. Include every detail, every word, every sentence.\n' +
+									'4. **Format:** Output plain text with clear paragraph breaks.\n' +
+									'5. **Noise:** Ignore non-speech sounds.\n\n' +
+									'Begin transcription now and continue until the audio ends.';
+
+							if (options.context && options.context.trim()) {
+								enhancedPrompt +=
+									'\n\n【用户提供的会议背景（仅用于提高识别准确性）】\n' +
+									options.context.trim() +
+									'\n【使用规则】\n- 仅用于人名/组织/术语识别\n- 不要添加音频中未出现的内容';
+							}
+
+							const response = await genAI.models.generateContent({
+								model: settings.model,
+								contents: [
+									{
+										role: 'user',
+										parts: [{ text: enhancedPrompt }, { fileData: { fileUri: uploadedFile!.uri!, mimeType } }],
+									},
+								],
+								config: {
+									temperature: settings.temperature,
+									maxOutputTokens: 65536,
+									abortSignal: workerSignal,
+								},
+							});
+
+							const text = response.text;
+							if (typeof text !== 'string') {
+								throw new Error('Gemini transcription error: No text content in response');
+							}
+							return text;
+						},
+						{
+							label: `Gemini transcription chunk ${chunkIndex}/${chunks.length}`,
+							signal: workerSignal,
+						},
+					);
+
+					completedChunks++;
+					this.emitProgress(options, {
+						provider: 'gemini',
+						stage: 'transcribe',
+						currentChunk: chunkIndex,
+						totalChunks: chunks.length,
+						completedChunks,
+					});
+					return result;
+				} finally {
+					if (uploadedFile?.name) {
+						try {
+							await genAI.files.delete({
+								name: uploadedFile.name,
+								config: { abortSignal: workerSignal },
+							});
+						} catch (error) {
+							if (!this.isAbortError(error)) {
+								console.warn('[AI Transcriber] Failed to delete uploaded Gemini file:', error);
+							}
+						}
+					}
+				}
+			},
+		);
+
+		const fullText = results.join('\n').trim();
+		this.emitProgress(options, { provider: 'gemini', stage: 'done', totalChunks: chunks.length, completedChunks });
+		console.info('[AI Transcriber] Gemini transcription complete.', { textLength: fullText.length });
+		return fullText;
+	}
+
+	private async waitForGeminiFileReady(
+		genAI: { files: { get: (params: { name: string; config?: { abortSignal?: AbortSignal } }) => Promise<{ name?: string; uri?: string; state?: string }> } },
+		initialFile: { name?: string; uri?: string; state?: string },
+		currentChunk: number,
+		totalChunks: number,
+		options: TranscribeOptions,
+	): Promise<{ name?: string; uri?: string; state?: string }> {
+		let file = initialFile;
+		const startedAt = Date.now();
+
+		while (file.state === 'PROCESSING') {
+			this.throwIfAborted(options.signal);
+
+			if (Date.now() - startedAt > GEMINI_FILE_PROCESSING_TIMEOUT_MS) {
+				throw new Error(`Gemini file processing timeout for chunk ${currentChunk}/${totalChunks}`);
+			}
+
+			this.emitProgress(options, {
+				provider: 'gemini',
+				stage: 'processing',
+				currentChunk,
+				totalChunks,
+			});
+
+			await this.sleep(1000, options.signal);
+			file = await genAI.files.get({
+				name: file.name!,
+				config: { abortSignal: options.signal },
+			});
+		}
+
+		if (file.state === 'FAILED') {
+			throw new Error(`Gemini file processing failed for chunk ${currentChunk}/${totalChunks}`);
+		}
+
+		return file;
+	}
+
+	/**
+	 * Gemini preprocessing: resample, no silence trimming, chunk at silence boundaries.
+	 */
+	private async preprocessForGemini(
+		blob: Blob,
+		maxDurationSeconds: number,
+		options: TranscribeOptions,
+	): Promise<Blob[]> {
+		console.info('[AI Transcriber] Gemini preprocess (WAV chunking) start.', { maxDurationSeconds, sizeBytes: blob.size });
+		const data = await this.decodeAndResample(blob, options.signal);
+		const chunks = await this.processResampledData(data, {
+			trimLongSilence: false,
+			minSilenceTrimSamples: 0,
+			maxDurationSeconds,
+			targetSampleRate: TARGET_SAMPLE_RATE,
+			silenceThreshold: SILENCE_THRESHOLD,
+			silenceWindowSeconds: SILENCE_WINDOW_SECONDS,
+			searchRangeSeconds: SEARCH_RANGE_SECONDS,
+			minChunkSeconds: MIN_CHUNK_SECONDS,
+		}, options);
+		console.info('[AI Transcriber] Gemini preprocess done.', { chunks: chunks.length, chunkBytes: chunks.map(chunk => chunk.size) });
+		return chunks;
+	}
+
+	/**
+	 * OpenAI preprocessing: resample, trim silence, chunk at silence boundaries.
+	 */
+	private async preprocess(
+		blob: Blob,
+		maxSecsInput: number | undefined,
+		options: TranscribeOptions,
+	): Promise<Blob[]> {
+		const MAX_CHUNK_SECONDS = maxSecsInput ?? 600;
+		const MIN_SILENCE_DURATION_SECONDS = 2;
+		const MIN_SILENCE_TRIM_SAMPLES = Math.floor(MIN_SILENCE_DURATION_SECONDS * TARGET_SAMPLE_RATE);
+
+		console.info('[AI Transcriber] OpenAI preprocess (WAV chunking) start.', { maxSecsInput, sizeBytes: blob.size });
+		const rawData = await this.decodeAndResample(blob, options.signal);
+		const chunks = await this.processResampledData(rawData, {
+			trimLongSilence: true,
+			minSilenceTrimSamples: MIN_SILENCE_TRIM_SAMPLES,
+			maxDurationSeconds: MAX_CHUNK_SECONDS,
+			targetSampleRate: TARGET_SAMPLE_RATE,
+			silenceThreshold: SILENCE_THRESHOLD,
+			silenceWindowSeconds: SILENCE_WINDOW_SECONDS,
+			searchRangeSeconds: SEARCH_RANGE_SECONDS,
+			minChunkSeconds: MIN_CHUNK_SECONDS,
+		}, options);
+		console.info('[AI Transcriber] OpenAI preprocess done.', { chunks: chunks.length, chunkBytes: chunks.map(chunk => chunk.size) });
+		return chunks;
+	}
+
+	/**
+	 * Decode audio blob and resample to 16kHz mono Float32Array.
+	 */
+	private async decodeAndResample(blob: Blob, signal?: AbortSignal): Promise<Float32Array> {
+		this.throwIfAborted(signal);
+		const arrayBuffer = await blob.arrayBuffer();
+		this.throwIfAborted(signal);
+
+		const decodeCtx = this.getDecodeAudioContext();
+		const originalBuffer = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
+		this.throwIfAborted(signal);
+
+		const targetLength = Math.ceil(originalBuffer.duration * TARGET_SAMPLE_RATE);
+		const offlineCtx = new OfflineAudioContext(1, targetLength, TARGET_SAMPLE_RATE);
+		const source = offlineCtx.createBufferSource();
+		source.buffer = originalBuffer;
+		source.connect(offlineCtx.destination);
+		source.start();
+		const resampled = await offlineCtx.startRendering();
+		this.throwIfAborted(signal);
+		return new Float32Array(resampled.getChannelData(0));
+	}
+
+	private async processResampledData(
+		rawData: Float32Array,
+		workerOptions: WorkerPreprocessOptions,
+		options: TranscribeOptions,
+	): Promise<Blob[]> {
+		this.throwIfAborted(options.signal);
+
+		if (typeof Worker !== 'undefined') {
+			try {
+				return await this.processWithWorker(rawData, workerOptions, options);
+			} catch (error) {
+				if (!this.isAbortError(error)) {
+					console.warn('[AI Transcriber] Worker preprocessing failed, falling back to main thread.', error);
+				} else {
+					throw error;
+				}
+			}
+		}
+
+		return this.processLocally(rawData, workerOptions, options.signal);
+	}
+
+	private async processWithWorker(
+		rawData: Float32Array,
+		options: WorkerPreprocessOptions,
+		transcribeOptions: TranscribeOptions,
+	): Promise<Blob[]> {
+		const workerUrl = this.getAudioWorkerUrl();
+		const worker = new Worker(workerUrl);
+
+		return await new Promise<Blob[]>((resolve, reject) => {
+			let settled = false;
+			const finish = (fn: () => void) => {
+				if (settled) return;
+				settled = true;
+				worker.terminate();
+				transcribeOptions.signal?.removeEventListener('abort', onAbort);
+				fn();
+			};
+
+			const onAbort = () => finish(() => reject(this.createAbortError()));
+
+			worker.onmessage = event => {
+				const payload = event.data as {
+					type: 'progress' | 'result' | 'error';
+					chunks?: ArrayBuffer[];
+					error?: string;
+				};
+
+				if (payload.type === 'error') {
+					finish(() => reject(new Error(payload.error || 'Worker preprocessing failed.')));
+					return;
+				}
+
+				if (payload.type === 'result') {
+					const chunks = (payload.chunks || []).map(buffer => new Blob([buffer], { type: 'audio/wav' }));
+					finish(() => resolve(chunks));
+				}
+			};
+
+			worker.onerror = event => {
+				finish(() => reject(new Error(event.message || 'Worker preprocessing error.')));
+			};
+
+			if (transcribeOptions.signal) {
+				transcribeOptions.signal.addEventListener('abort', onAbort);
+			}
+
+			const workerInput = rawData.buffer.slice(0);
+			worker.postMessage(
+				{
+					type: 'process',
+					data: workerInput,
+					options,
+				},
+				[workerInput],
+			);
+		});
+	}
+
+	private processLocally(
+		rawData: Float32Array,
+		options: WorkerPreprocessOptions,
+		signal?: AbortSignal,
+	): Blob[] {
+		this.throwIfAborted(signal);
+		const data = options.trimLongSilence
+			? this.trimSilence(rawData, options.minSilenceTrimSamples, options.silenceThreshold)
+			: rawData;
+		return this.splitAtSilenceToWav(data, options, signal);
+	}
+
+	private getAudioWorkerUrl(): string {
+		if (TranscriberService.audioWorkerUrl) {
+			return TranscriberService.audioWorkerUrl;
+		}
+
+		const workerSource = `
+self.onmessage = (event) => {
+	const payload = event.data || {};
+	if (payload.type !== 'process') return;
+	try {
+		const options = payload.options;
+		const input = new Float32Array(payload.data);
+		const data = options.trimLongSilence
+			? trimSilence(input, options.minSilenceTrimSamples, options.silenceThreshold)
+			: input;
+		const chunks = splitAtSilenceToWavBuffers(data, options);
+		self.postMessage({ type: 'result', chunks }, chunks);
+	} catch (error) {
+		const message = (error && error.message) ? error.message : String(error);
+		self.postMessage({ type: 'error', error: message });
+	}
+};
+
+function trimSilence(rawData, minSilenceTrimSamples, silenceThreshold) {
+	let samplesToKeep = 0;
+	let silentCount = 0;
+	for (let i = 0; i < rawData.length; i++) {
+		if (Math.abs(rawData[i]) <= silenceThreshold) {
+			silentCount++;
+		} else {
+			if (silentCount > 0 && silentCount < minSilenceTrimSamples) {
+				samplesToKeep += silentCount;
+			}
+			silentCount = 0;
+			samplesToKeep++;
+		}
+	}
+
+	const data = new Float32Array(samplesToKeep);
+	let idx = 0;
+	silentCount = 0;
+	for (let i = 0; i < rawData.length; i++) {
+		if (Math.abs(rawData[i]) <= silenceThreshold) {
+			silentCount++;
+		} else {
+			if (silentCount > 0 && silentCount < minSilenceTrimSamples) {
+				for (let j = i - silentCount; j < i; j++) {
+					data[idx++] = rawData[j];
+				}
+			}
+			silentCount = 0;
+			data[idx++] = rawData[i];
+		}
+	}
+	return data;
+}
+
+function findSilenceSplitPoint(data, desiredSplit, totalSamples, silenceWindowSamples, searchRangeSamples, silenceThreshold) {
+	const backwardStart = Math.max(silenceWindowSamples, desiredSplit - searchRangeSamples);
+	for (let i = desiredSplit; i >= backwardStart; i--) {
+		let silent = true;
+		for (let j = i - silenceWindowSamples; j < i; j++) {
+			if (Math.abs(data[j]) > silenceThreshold) {
+				silent = false;
+				break;
+			}
+		}
+		if (silent) return i - silenceWindowSamples;
+	}
+
+	const forwardEnd = Math.min(totalSamples, desiredSplit + searchRangeSamples);
+	for (let i = desiredSplit; i < forwardEnd; i++) {
+		let silent = true;
+		for (let j = i; j < i + silenceWindowSamples && j < totalSamples; j++) {
+			if (Math.abs(data[j]) > silenceThreshold) {
+				silent = false;
+				break;
+			}
+		}
+		if (silent) return i;
+	}
+
+	return null;
+}
+
+function splitAtSilenceToWavBuffers(data, options) {
+	const maxSamples = Math.floor(options.maxDurationSeconds * options.targetSampleRate);
+	const minChunkSamples = Math.floor(options.minChunkSeconds * options.targetSampleRate);
+	const silenceWindowSamples = Math.floor(options.silenceWindowSeconds * options.targetSampleRate);
+	const searchRangeSamples = Math.floor(options.searchRangeSeconds * options.targetSampleRate);
+	const chunks = [];
+
+	let startSample = 0;
+	const totalSamples = data.length;
+	while (startSample < totalSamples) {
+		let endSample = Math.min(startSample + maxSamples, totalSamples);
+
+		if (endSample < totalSamples) {
+			const splitPoint = findSilenceSplitPoint(
+				data,
+				endSample,
+				totalSamples,
+				silenceWindowSamples,
+				searchRangeSamples,
+				options.silenceThreshold
+			);
+			if (splitPoint !== null && splitPoint > startSample) {
+				endSample = splitPoint;
+			}
+		}
+
+		const segmentSamples = endSample - startSample;
+		if (segmentSamples >= minChunkSamples) {
+			const segment = data.subarray(startSample, endSample);
+			chunks.push(float32ToWavBuffer(segment, options.targetSampleRate));
+		}
+
+		startSample = endSample;
+	}
+
+	return chunks;
+}
+
+function float32ToWavBuffer(samples, sampleRate) {
+	const dataSize = samples.length * 2;
+	const wavBuffer = new ArrayBuffer(44 + dataSize);
+	const view = new DataView(wavBuffer);
+
+	writeString(view, 0, 'RIFF');
+	view.setUint32(4, 36 + dataSize, true);
+	writeString(view, 8, 'WAVE');
+	writeString(view, 12, 'fmt ');
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true);
+	view.setUint16(22, 1, true);
+	view.setUint32(24, sampleRate, true);
+	view.setUint32(28, sampleRate * 2, true);
+	view.setUint16(32, 2, true);
+	view.setUint16(34, 16, true);
+	writeString(view, 36, 'data');
+	view.setUint32(40, dataSize, true);
+
+	let offset = 44;
+	for (let i = 0; i < samples.length; i++) {
+		const sample = Math.max(-1, Math.min(1, samples[i]));
+		view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+		offset += 2;
+	}
+
+	return wavBuffer;
+}
+
+function writeString(view, offset, value) {
+	for (let i = 0; i < value.length; i++) {
+		view.setUint8(offset + i, value.charCodeAt(i));
+	}
+}
+`;
+
+		const blob = new Blob([workerSource], { type: 'application/javascript' });
+		TranscriberService.audioWorkerUrl = URL.createObjectURL(blob);
+		return TranscriberService.audioWorkerUrl;
+	}
+
+	private trimSilence(rawData: Float32Array, minSilenceTrimSamples: number, silenceThreshold: number): Float32Array {
+		let samplesToKeep = 0;
+		let silentCount = 0;
+		for (let i = 0; i < rawData.length; i++) {
+			if (Math.abs(rawData[i]) <= silenceThreshold) {
+				silentCount++;
+			} else {
+				if (silentCount > 0 && silentCount < minSilenceTrimSamples) {
+					samplesToKeep += silentCount;
+				}
+				silentCount = 0;
+				samplesToKeep++;
+			}
+		}
+
+		const data = new Float32Array(samplesToKeep);
+		let idx = 0;
+		silentCount = 0;
+		for (let i = 0; i < rawData.length; i++) {
+			if (Math.abs(rawData[i]) <= silenceThreshold) {
+				silentCount++;
+			} else {
+				if (silentCount > 0 && silentCount < minSilenceTrimSamples) {
+					for (let j = i - silentCount; j < i; j++) {
+						data[idx++] = rawData[j];
+					}
+				}
+				silentCount = 0;
+				data[idx++] = rawData[i];
+			}
+		}
+		return data;
+	}
+
+	private findSilenceSplitPoint(
+		data: Float32Array,
+		desiredSplit: number,
+		totalSamples: number,
+		silenceWindowSamples: number,
+		searchRangeSamples: number,
+		silenceThreshold: number,
+	): number | null {
+		const backwardStart = Math.max(silenceWindowSamples, desiredSplit - searchRangeSamples);
+		for (let i = desiredSplit; i >= backwardStart; i--) {
+			let silent = true;
+			for (let j = i - silenceWindowSamples; j < i; j++) {
+				if (Math.abs(data[j]) > silenceThreshold) {
+					silent = false;
+					break;
+				}
+			}
+			if (silent) return i - silenceWindowSamples;
+		}
+
+		const forwardEnd = Math.min(totalSamples, desiredSplit + searchRangeSamples);
+		for (let i = desiredSplit; i < forwardEnd; i++) {
+			let silent = true;
+			for (let j = i; j < i + silenceWindowSamples && j < totalSamples; j++) {
+				if (Math.abs(data[j]) > silenceThreshold) {
+					silent = false;
+					break;
+				}
+			}
+			if (silent) return i;
+		}
+		return null;
+	}
+
+	private splitAtSilenceToWav(
+		data: Float32Array,
+		options: WorkerPreprocessOptions,
+		signal?: AbortSignal,
+	): Blob[] {
+		const maxSamples = Math.floor(options.maxDurationSeconds * options.targetSampleRate);
+		const minChunkSamples = Math.floor(options.minChunkSeconds * options.targetSampleRate);
+		const silenceWindowSamples = Math.floor(options.silenceWindowSeconds * options.targetSampleRate);
+		const searchRangeSamples = Math.floor(options.searchRangeSeconds * options.targetSampleRate);
+		const totalSamples = data.length;
+		const chunks: Blob[] = [];
+
+		let startSample = 0;
+		while (startSample < totalSamples) {
+			this.throwIfAborted(signal);
+			let endSample = Math.min(startSample + maxSamples, totalSamples);
+
+			if (endSample < totalSamples) {
+				const splitPoint = this.findSilenceSplitPoint(
+					data,
+					endSample,
+					totalSamples,
+					silenceWindowSamples,
+					searchRangeSamples,
+					options.silenceThreshold,
+				);
+				if (splitPoint !== null && splitPoint > startSample) {
+					endSample = splitPoint;
+				}
+			}
+
+			const segmentSamples = endSample - startSample;
+			if (segmentSamples >= minChunkSamples) {
+				const wav = this.float32ToWavBuffer(data.subarray(startSample, endSample), options.targetSampleRate);
+				chunks.push(new Blob([wav], { type: 'audio/wav' }));
+			}
+
+			startSample = endSample;
+		}
+
+		return chunks;
+	}
+
+	private float32ToWavBuffer(samples: Float32Array, sampleRate: number): ArrayBuffer {
+		const dataSize = samples.length * 2;
+		const wavBuffer = new ArrayBuffer(44 + dataSize);
+		const view = new DataView(wavBuffer);
+
+		this.writeString(view, 0, 'RIFF');
 		view.setUint32(4, 36 + dataSize, true);
-		writeString('WAVE', 8);
-		writeString('fmt ', 12);
+		this.writeString(view, 8, 'WAVE');
+		this.writeString(view, 12, 'fmt ');
 		view.setUint32(16, 16, true);
 		view.setUint16(20, 1, true);
-		view.setUint16(22, numOfChannels, true);
+		view.setUint16(22, 1, true);
 		view.setUint32(24, sampleRate, true);
-		view.setUint32(28, sampleRate * blockAlign, true);
-		view.setUint16(32, blockAlign, true);
-		view.setUint16(34, bitDepth, true);
-		writeString('data', 36);
+		view.setUint32(28, sampleRate * 2, true);
+		view.setUint16(32, 2, true);
+		view.setUint16(34, 16, true);
+		this.writeString(view, 36, 'data');
 		view.setUint32(40, dataSize, true);
 
 		let offset = 44;
-		const channelData = buffer.getChannelData(0);
-		for (let i = 0; i < channelData.length; i++) {
-			const s = Math.max(-1, Math.min(1, channelData[i]));
-			view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+		for (let i = 0; i < samples.length; i++) {
+			const sample = Math.max(-1, Math.min(1, samples[i]));
+			view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
 			offset += 2;
 		}
 
-		return new Blob([view], { type: 'audio/wav' });
+		return wavBuffer;
 	}
 
-} 
+	private writeString(view: DataView, offset: number, value: string): void {
+		for (let i = 0; i < value.length; i++) {
+			view.setUint8(offset + i, value.charCodeAt(i));
+		}
+	}
+}

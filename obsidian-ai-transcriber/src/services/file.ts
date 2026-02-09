@@ -85,6 +85,17 @@ export class FileService {
 		return path;
 	}
 
+	/**
+	 * Update an existing text file by path.
+	 */
+	async updateText(path: string, text: string): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) {
+			throw new Error(`File not found: ${path}`);
+		}
+		await this.app.vault.modify(file, text);
+	}
+
 	// Add a method to open a file in the workspace
 	async openFile(path: string): Promise<void> {
 		const file = this.app.vault.getAbstractFileByPath(path);

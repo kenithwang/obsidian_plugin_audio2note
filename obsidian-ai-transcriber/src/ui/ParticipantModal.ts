@@ -1,6 +1,7 @@
 import { App, Modal, Notice, Setting } from 'obsidian';
 import ObsidianAITranscriber from '../../main';
 import { Participant } from '../settings/types';
+import { t } from '../i18n';
 
 export default class ParticipantModal extends Modal {
 	private plugin: ObsidianAITranscriber;
@@ -22,17 +23,18 @@ export default class ParticipantModal extends Modal {
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.createEl('h2', { text: this.participant ? '编辑人物' : '新增人物' });
+		contentEl.addClass('ai-transcriber-participant-modal');
+		contentEl.createEl('h2', { text: this.participant ? t('participantModalEditTitle') : t('participantModalAddTitle') });
 
 		let name = this.participant ? this.participant.name : '';
 		let org = this.participant ? this.participant.org : '';
 		let intro = this.participant ? this.participant.intro : '';
 
 		new Setting(contentEl)
-			.setName('姓名')
-			.setDesc('必填')
+			.setName(t('participantName'))
+			.setDesc(t('participantNameDesc'))
 			.addText(text => {
-				text.setPlaceholder('姓名');
+				text.setPlaceholder(t('participantNamePlaceholder'));
 				text.setValue(name);
 				text.onChange(value => {
 					name = value;
@@ -40,10 +42,10 @@ export default class ParticipantModal extends Modal {
 			});
 
 		new Setting(contentEl)
-			.setName('组织/公司')
-			.setDesc('可选')
+			.setName(t('participantOrg'))
+			.setDesc(t('participantOrgDesc'))
 			.addText(text => {
-				text.setPlaceholder('Organization');
+				text.setPlaceholder(t('participantOrgPlaceholder'));
 				text.setValue(org);
 				text.onChange(value => {
 					org = value;
@@ -51,10 +53,10 @@ export default class ParticipantModal extends Modal {
 			});
 
 		new Setting(contentEl)
-			.setName('人物介绍')
-			.setDesc('简要身份/职责，用于识别')
+			.setName(t('participantIntro'))
+			.setDesc(t('participantIntroDesc'))
 			.addTextArea(text => {
-				text.setPlaceholder('如：产品负责人，负责XX');
+				text.setPlaceholder(t('participantIntroPlaceholder'));
 				text.setValue(intro);
 				text.onChange(value => {
 					intro = value;
@@ -65,19 +67,19 @@ export default class ParticipantModal extends Modal {
 
 		new Setting(contentEl)
 			.addButton(btn =>
-				btn.setButtonText('取消').onClick(() => {
+				btn.setButtonText(t('cancel')).onClick(() => {
 					this.onSubmit(null);
 					this.close();
 				})
 			)
 			.addButton(btn =>
 				btn
-					.setButtonText('保存')
+					.setButtonText(t('save'))
 					.setCta()
 					.onClick(() => {
 						const trimmedName = name.trim();
 						if (!trimmedName) {
-							new Notice('姓名不能为空');
+							new Notice(t('participantNameEmpty'));
 							return;
 						}
 						const participant: Participant = {

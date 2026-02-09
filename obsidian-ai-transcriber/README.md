@@ -5,13 +5,17 @@ An Obsidian plugin that uses AI to record and transcribe audio into structured M
 ## Features
 
 - 🎤 **Record Audio**: Open a modal or click the ribbon icon to record audio within Obsidian.
-- 🤖 **AI Transcription**: Transcribe recorded or imported audio files (`.webm`, `.m4a`, `.mp3`) to text using OpenAI or Gemini models. When using Gemini, audio is preprocessed and compressed to MP3 before upload for faster transcription.
+- 🤖 **AI Transcription**: Transcribe recorded or imported audio files (`.webm`, `.m4a`, `.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`, `.opus`, `.mp4`) to text using OpenAI or Gemini models.
+- ⏹️ **Cancelable AI Tasks**: Cancel in-flight transcription/editing from the status bar.
+- 📈 **Live Progress**: Status bar and notices show chunk-level progress during long jobs.
+- 🌊 **Streaming Editing Output**: Edited transcript file is written incrementally while AI is generating.
 - ✍️ **AI Editing** (optional): Automatically refine raw transcripts into structured notes (e.g., meeting minutes). Utilizes a customizable System Prompt via a template management system.
 - 🎨 **System Prompt Templates**: Create, manage, and select different system prompts for the AI Editor to handle various transcript processing needs.
+- 📦 **Template Import/Export**: Export and import system prompt templates as JSON.
 - 💾 **Flexible File Saving**: Save raw and/or edited transcripts to specified vault subdirectories.
 - ⚙️ **Settings Tab**: Configure transcription and editing providers, models, API keys, manage System Prompt templates, set editor user prompt, temperature, and output directories.
 - 🔄 **Context Menu**: Right-click an audio file in the file explorer to transcribe it directly.
-- 📊 **Status Bar**: View plugin status (Idle, Recording…, Transcribing…, Editing…) in the status bar (bottom-right corner).
+- 📊 **Status Bar**: View plugin status and cancel active jobs from the status bar (bottom-right corner).
 
 ## Installation
 
@@ -33,7 +37,7 @@ An Obsidian plugin that uses AI to record and transcribe audio into structured M
 
 ### Transcribing Existing Audio Files
 
-- Right-click any `.webm`, `.m4a`, or `.mp3` file in the file explorer.
+- Right-click any supported audio file (`.webm`, `.m4a`, `.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`, `.opus`, `.mp4`) in the file explorer.
 - Select **"Transcribe with AI"**.
     - If AI Editing is enabled in settings, a modal will first appear asking you to select a System Prompt Template.
     - If you cancel template selection, the entire transcription task is aborted.
@@ -144,8 +148,9 @@ obsidian-ai-transcriber/
 - Handles audio transcription with OpenAI or Gemini
 - Preprocessing pipeline: decode → resample to 16kHz mono → trim silence → chunk
 - OpenAI: Chunks at 10-minute intervals (25MB limit per request)
-- Gemini: Chunks at 8-hour intervals with file upload API
+- Gemini: Uses File API with chunking (15-minute target) or direct compressed upload based on settings/file size
 - Intelligent chunking at silence boundaries to avoid splitting speech
+- CPU-heavy trimming/splitting is moved to a Web Worker when available
 
 **EditorService** (`src/services/editor.ts`)
 - Post-processes transcripts using chat completion APIs

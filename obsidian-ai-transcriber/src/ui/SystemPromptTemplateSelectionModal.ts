@@ -2,6 +2,7 @@ import { App, Modal, Setting } from 'obsidian';
 import ObsidianAITranscriber from '../../main';
 import { Participant } from '../settings/types';
 import ParticipantModal from './ParticipantModal';
+import { t } from '../i18n';
 
 export interface TemplateSelectionResult {
 	name: string;
@@ -30,7 +31,7 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.addClass('ai-transcriber-template-selection-modal');
-		contentEl.createEl('h2', { text: 'Select System Prompt Template' });
+		contentEl.createEl('h2', { text: t('templateSelectTitle') });
 
 		const templates = this.plugin.settings.editor.systemPromptTemplates;
 		if (!this.plugin.settings.editor.participants) {
@@ -52,8 +53,8 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 		}
 
 		new Setting(contentEl)
-			.setName('Template')
-			.setDesc('Choose a system prompt template for the editor.')
+			.setName(t('templateLabel'))
+			.setDesc(t('templateDesc'))
 			.addDropdown(dropdown => {
 				templates.forEach(template => {
 					dropdown.addOption(template.name, template.name);
@@ -65,11 +66,11 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 			});
 
 		new Setting(contentEl)
-			.setName('参会人员')
-			.setDesc('选择参会人员，或新增人物。')
+			.setName(t('participantsLabel'))
+			.setDesc(t('participantsDesc'))
 			.addButton(btn =>
 				btn
-					.setButtonText('新增人物')
+					.setButtonText(t('participantsAdd'))
 					.setCta()
 					.onClick(() => {
 						new ParticipantModal(this.app, this.plugin, participant => {
@@ -81,7 +82,7 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 			);
 
 		if (this.plugin.settings.editor.participants.length === 0) {
-			contentEl.createEl('div', { text: '暂无参会人员，请先新增。' });
+			contentEl.createEl('div', { text: t('participantsEmpty') });
 		} else {
 			this.plugin.settings.editor.participants.forEach(participant => {
 				new Setting(contentEl)
@@ -100,7 +101,7 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 						});
 					})
 					.addButton(btn =>
-						btn.setButtonText('编辑').onClick(() => {
+						btn.setButtonText(t('participantsEdit')).onClick(() => {
 							new ParticipantModal(this.app, this.plugin, updated => {
 								if (!updated) return;
 								const idx = this.plugin.settings.editor.participants.findIndex(
@@ -114,17 +115,17 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 						})
 					)
 					.addButton(btn =>
-						btn.setButtonText('删除').setWarning().onClick(() => {
+						btn.setButtonText(t('participantsDelete')).setWarning().onClick(() => {
 							const modal = new Modal(this.app);
-							modal.contentEl.createEl('h2', { text: '确认删除' });
-							modal.contentEl.createEl('p', { text: `确定要删除 "${participant.name}" 吗？` });
+							modal.contentEl.createEl('h2', { text: t('participantsDeleteConfirmTitle') });
+							modal.contentEl.createEl('p', { text: t('participantsDeleteConfirmText', { name: participant.name }) });
 							new Setting(modal.contentEl)
 								.addButton(cancel =>
-									cancel.setButtonText('取消').onClick(() => modal.close())
+									cancel.setButtonText(t('cancel')).onClick(() => modal.close())
 								)
 								.addButton(confirm =>
 									confirm
-										.setButtonText('删除')
+										.setButtonText(t('participantsDelete'))
 										.setWarning()
 										.onClick(() => {
 											this.selectedParticipantIds.delete(participant.id);
@@ -143,10 +144,10 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 		}
 
 		new Setting(contentEl)
-			.setName('参会目的（可选）')
-			.setDesc('简要说明本次会议目的/背景。')
+			.setName(t('meetingPurposeLabel'))
+			.setDesc(t('meetingPurposeDesc'))
 			.addTextArea(text => {
-				text.setPlaceholder('可选，简要描述...');
+				text.setPlaceholder(t('meetingPurposePlaceholder'));
 				text.setValue(this.meetingPurpose);
 				text.onChange(value => {
 					this.meetingPurpose = value;
@@ -157,14 +158,14 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 
 		new Setting(contentEl)
 			.addButton(btn =>
-				btn.setButtonText('Cancel').onClick(() => {
+				btn.setButtonText(t('cancel')).onClick(() => {
 					this.onSubmit(null);
 					this.close();
 				})
 			)
 			.addButton(btn =>
 				btn
-					.setButtonText('Confirm')
+					.setButtonText(t('confirm'))
 					.setCta()
 					.onClick(() => {
 						let context = '';
@@ -173,7 +174,7 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 						);
 						if (selectedParticipants.length) {
 							context +=
-								'参会人员：\n' +
+								`${t('contextParticipantsTitle')}\n` +
 								selectedParticipants
 									.map(
 										p =>
@@ -182,7 +183,7 @@ export class SystemPromptTemplateSelectionModal extends Modal {
 									.join('\n');
 						}
 						if (this.meetingPurpose && this.meetingPurpose.trim()) {
-							context += `${context ? '\n\n' : ''}会议目的：\n${this.meetingPurpose.trim()}`;
+							context += `${context ? '\n\n' : ''}${t('contextPurposeTitle')}\n${this.meetingPurpose.trim()}`;
 						}
 						this.onSubmit({
 							name: this.selectedName,
