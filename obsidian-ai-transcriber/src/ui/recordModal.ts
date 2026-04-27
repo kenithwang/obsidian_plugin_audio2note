@@ -131,6 +131,7 @@ export default class RecordModal extends Modal {
 						const selectedTemplateName =
 							typeof selection === 'object' && selection ? selection.name : selection;
 						const context = typeof selection === 'object' && selection ? selection.context : '';
+						const participants = typeof selection === 'object' && selection ? selection.participants : [];
 						if (!selectedTemplateName) {
 							new Notice(t('noticeTemplateSelectionCancelledAudioSaved'));
 							this.plugin.updateStatus(t('statusIdle'));
@@ -149,6 +150,7 @@ export default class RecordModal extends Modal {
 						await this.plugin.processAudioBlob(result.blob, baseName, {
 							systemPromptOverride: selectedTemplate.prompt,
 							context,
+							participants,
 							saveRawWhenEditorEnabled: this.plugin.settings.editor.keepOriginal,
 							openResult: true,
 						});

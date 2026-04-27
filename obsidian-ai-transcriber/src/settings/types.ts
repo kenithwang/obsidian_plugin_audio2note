@@ -38,9 +38,15 @@ export interface EditorSettings {
 	keepOriginal: boolean;
 }
 
+export interface DiarizationSettings {
+	mode: 'local-python';
+	fallbackToLlm: boolean;
+}
+
 export interface PluginSettings {
 	transcriber: TranscriberSettings;
 	editor: EditorSettings;
+	diarization: DiarizationSettings;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -70,5 +76,9 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 		userPrompt: "Here's the transcript:\n\n",
 		temperature: 0.3,
 		keepOriginal: true,
+	},
+	diarization: {
+		mode: 'local-python',
+		fallbackToLlm: true,
 	},
 };

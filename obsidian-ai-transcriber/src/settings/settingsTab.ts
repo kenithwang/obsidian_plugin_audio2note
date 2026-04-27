@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Setting, Modal, TextComponent, TextAreaComponent, Notice } from 'obsidian';
 import ObsidianAITranscriber from '../../main';
 import { SystemPromptTemplate } from './types';
+import { SidecarStatus } from '../services/sidecar';
 import { t } from '../i18n';
 
 export default class SettingsTab extends PluginSettingTab {
@@ -29,6 +30,122 @@ export default class SettingsTab extends PluginSettingTab {
 			this.saveDebounceTimer = null;
 		}
 		await this.plugin.saveSettings();
+	}
+
+	private formatDiarizationStatus(status: SidecarStatus): string {
+		if (status.code === 'configured') {
+			const python = status.config?.pythonPath ? `\nPython: ${status.config.pythonPath}` : '';
+			return `${t('diarizationStatusConfigured')}${python}`;
+		}
+		if (status.code === 'not_configured') {
+			return t('diarizationStatusNotConfigured');
+		}
+		return t('diarizationStatusError', { message: status.error || status.message });
+	}
+
+	private renderDiarizationSettings(containerEl: HTMLElement): void {
+		containerEl.createEl('h2', { text: t('diarizationSettingsTitle') });
+
+		const statusSetting = new Setting(containerEl)
+			.setName(t('diarizationStatusName'))
+			.setDesc(t('diarizationStatusChecking'));
+		let authToken = '';
+
+		const refreshStatus = async () => {
+			const status = await this.plugin.refreshDiarizationStatusBar();
+			statusSetting.setDesc(this.formatDiarizationStatus(status));
+			if (status.config?.authToken && !authToken) {
+				authToken = status.config.authToken;
+			}
+		};
+
+		new Setting(containerEl)
+			.setName(t('diarizationAuthTokenName'))
+			.setDesc(t('diarizationAuthTokenDesc'))
+			.addText(text => {
+				text.inputEl.type = 'password';
+				text
+					.setPlaceholder(t('diarizationAuthTokenPlaceholder'))
+					.onChange(value => {
+						authToken = value;
+					});
+
+				void this.plugin.sidecarService.getLocalConfig().then(config => {
+					if (config?.authToken) {
+						authToken = config.authToken;
+						text.setValue(config.authToken);
+					}
+				});
+			});
+
+		new Setting(containerEl)
+			.setName(t('diarizationSetupButton'))
+			.setDesc(t('diarizationSetupDesc'))
+			.addButton(button =>
+				button
+					.setButtonText(t('diarizationSetupButton'))
+					.setCta()
+					.onClick(async () => {
+						button.setDisabled(true);
+						try {
+							statusSetting.setDesc(t('diarizationStatusSettingUp'));
+							const status = await this.plugin.sidecarService.configure({
+								authToken,
+								onProgress: message => {
+									statusSetting.setDesc(`${t('diarizationStatusSettingUp')}\n${message}`);
+								},
+							});
+							await this.plugin.refreshDiarizationStatusBar(status);
+							statusSetting.setDesc(this.formatDiarizationStatus(status));
+							new Notice(
+								status.code === 'configured'
+									? t('diarizationConfiguredNotice')
+									: t('diarizationStatusError', { message: status.error || status.message }),
+							);
+						} finally {
+							button.setDisabled(false);
+						}
+					})
+			)
+			.addButton(button =>
+				button
+					.setButtonText(t('diarizationTestButton'))
+					.onClick(async () => {
+						button.setDisabled(true);
+						try {
+							statusSetting.setDesc(t('diarizationStatusTesting'));
+							const status = await this.plugin.sidecarService.testConnection(message => {
+								statusSetting.setDesc(`${t('diarizationStatusTesting')}\n${message}`);
+							});
+							await this.plugin.refreshDiarizationStatusBar(status);
+							statusSetting.setDesc(this.formatDiarizationStatus(status));
+							new Notice(
+								status.code === 'configured'
+									? t('diarizationTestSuccessNotice')
+									: t('diarizationStatusError', { message: status.error || status.message }),
+							);
+						} finally {
+							button.setDisabled(false);
+						}
+					})
+			)
+			.addButton(button =>
+				button
+					.setButtonText(t('diarizationResetButton'))
+					.setWarning()
+					.onClick(async () => {
+						button.setDisabled(true);
+						try {
+							await this.plugin.sidecarService.resetLocalConfig();
+							await refreshStatus();
+							new Notice(t('diarizationResetNotice'));
+						} finally {
+							button.setDisabled(false);
+						}
+					})
+			);
+
+		void refreshStatus();
 	}
 
 	private ensureUniqueTemplateName(name: string, existing: Set<string>): string {
@@ -293,6 +410,8 @@ export default class SettingsTab extends PluginSettingTab {
 						})
 					);
 		}
+
+		this.renderDiarizationSettings(containerEl);
 
 		// Editor Settings
 		containerEl.createEl('h2', { text: '✏️ Editor Settings' });

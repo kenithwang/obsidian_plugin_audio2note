@@ -11,7 +11,8 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-record-modal,
 .ai-transcriber-template-selection-modal,
 .ai-transcriber-participant-modal,
-.ai-transcriber-template-editor-modal {
+.ai-transcriber-template-editor-modal,
+.ai-transcriber-speaker-mapping-view {
   --at-radius-xl: 16px;
   --at-radius-lg: 12px;
   --at-radius-md: 10px;
@@ -42,7 +43,8 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-record-modal .recorder-button-container button,
 .ai-transcriber-template-selection-modal button,
 .ai-transcriber-participant-modal button,
-.ai-transcriber-template-editor-modal button {
+.ai-transcriber-template-editor-modal button,
+.ai-transcriber-speaker-mapping-view button {
   padding: 8px 16px;
   min-height: 34px;
   border-radius: 8px;
@@ -57,7 +59,8 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-record-modal .recorder-button-container button:hover:not([disabled]),
 .ai-transcriber-template-selection-modal button:hover:not([disabled]),
 .ai-transcriber-participant-modal button:hover:not([disabled]),
-.ai-transcriber-template-editor-modal button:hover:not([disabled]) {
+.ai-transcriber-template-editor-modal button:hover:not([disabled]),
+.ai-transcriber-speaker-mapping-view button:hover:not([disabled]) {
   background: var(--background-modifier-hover);
   border-color: var(--background-modifier-border-hover);
 }
@@ -65,14 +68,16 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-record-modal .recorder-button-container button:active:not([disabled]),
 .ai-transcriber-template-selection-modal button:active:not([disabled]),
 .ai-transcriber-participant-modal button:active:not([disabled]),
-.ai-transcriber-template-editor-modal button:active:not([disabled]) {
+.ai-transcriber-template-editor-modal button:active:not([disabled]),
+.ai-transcriber-speaker-mapping-view button:active:not([disabled]) {
   transform: translateY(1px) scale(0.985);
 }
 
 .ai-transcriber-record-modal .recorder-button-container button[disabled],
 .ai-transcriber-template-selection-modal button[disabled],
 .ai-transcriber-participant-modal button[disabled],
-.ai-transcriber-template-editor-modal button[disabled] {
+.ai-transcriber-template-editor-modal button[disabled],
+.ai-transcriber-speaker-mapping-view button[disabled] {
   opacity: 0.5;
   cursor: not-allowed;
   transform: none;
@@ -81,7 +86,8 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-record-modal .recorder-button-container button.mod-cta,
 .ai-transcriber-template-selection-modal button.mod-cta,
 .ai-transcriber-participant-modal button.mod-cta,
-.ai-transcriber-template-editor-modal button.mod-cta {
+.ai-transcriber-template-editor-modal button.mod-cta,
+.ai-transcriber-speaker-mapping-view button.mod-cta {
   background: var(--at-accent);
   color: var(--text-on-accent);
   border-color: color-mix(in srgb, var(--at-accent) 70%, black 30%);
@@ -90,7 +96,8 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-record-modal .recorder-button-container button.mod-cta:hover:not([disabled]),
 .ai-transcriber-template-selection-modal button.mod-cta:hover:not([disabled]),
 .ai-transcriber-participant-modal button.mod-cta:hover:not([disabled]),
-.ai-transcriber-template-editor-modal button.mod-cta:hover:not([disabled]) {
+.ai-transcriber-template-editor-modal button.mod-cta:hover:not([disabled]),
+.ai-transcriber-speaker-mapping-view button.mod-cta:hover:not([disabled]) {
   background: var(--at-accent-hover);
   border-color: color-mix(in srgb, var(--at-accent-hover) 70%, black 30%);
 }
@@ -98,7 +105,8 @@ If your plugin does not need CSS, delete this file.
 .ai-transcriber-record-modal .recorder-button-container button:focus-visible,
 .ai-transcriber-template-selection-modal button:focus-visible,
 .ai-transcriber-participant-modal button:focus-visible,
-.ai-transcriber-template-editor-modal button:focus-visible {
+.ai-transcriber-template-editor-modal button:focus-visible,
+.ai-transcriber-speaker-mapping-view button:focus-visible {
   outline: 2px solid var(--at-accent-hover);
   outline-offset: 2px;
 }
@@ -504,5 +512,77 @@ If your plugin does not need CSS, delete this file.
   .ai-transcriber-settings .setting-item-control {
     flex-basis: 100% !important;
     max-width: 100% !important;
+  }
+}
+/* ══════════════════════════════════════════════
+   Speaker mapping side panel
+   ══════════════════════════════════════════════ */
+.ai-transcriber-speaker-mapping-view {
+  height: 100%;
+  padding: 14px;
+  color: var(--at-text);
+  background: var(--background-primary);
+}
+
+.ai-transcriber-speaker-mapping-view .speaker-map-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 100%;
+}
+
+.ai-transcriber-speaker-mapping-view h2 {
+  margin: 0;
+  font-size: 1.05em;
+  font-weight: 650;
+}
+
+.ai-transcriber-speaker-mapping-view .speaker-map-desc,
+.ai-transcriber-speaker-mapping-view .speaker-map-empty {
+  margin: 0;
+  color: var(--at-muted);
+  font-size: 0.9em;
+  line-height: 1.45;
+}
+
+.ai-transcriber-speaker-mapping-view .speaker-map-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ai-transcriber-speaker-mapping-view .speaker-map-row {
+  display: grid;
+  grid-template-columns: minmax(86px, auto) 1fr auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: var(--at-border);
+  border-radius: 8px;
+  background: var(--at-surface);
+}
+
+.ai-transcriber-speaker-mapping-view .speaker-map-id {
+  font-family: var(--font-monospace);
+  font-size: 0.82em;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.ai-transcriber-speaker-mapping-view select {
+  width: 100%;
+  min-width: 0;
+}
+
+.ai-transcriber-speaker-mapping-view .speaker-map-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+@media (max-width: 520px) {
+  .ai-transcriber-speaker-mapping-view .speaker-map-row {
+    grid-template-columns: 1fr;
   }
 }

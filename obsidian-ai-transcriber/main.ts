@@ -1,4 +1,4 @@
-import { Editor, MarkdownView, Notice, Plugin, TFile } from 'obsidian';
+import { Editor, MarkdownView, Notice, Plugin, TFile, WorkspaceLeaf } from 'obsidian';
 import RecordModal from './src/ui/recordModal';
 import { RecorderService } from './src/services/recorder';
 import { FileService } from './src/services/file';
@@ -6,7 +6,15 @@ import SettingsTab from './src/settings/settingsTab';
 import { PluginSettings, DEFAULT_SETTINGS } from './src/settings/types';
 import { TranscriberService, TranscriptionProgress } from './src/services/transcriber';
 import { EditProgress, EditorService } from './src/services/editor';
+import { DiarizationSegment, SidecarService, SidecarStatus, SpeakerAnalysis } from './src/services/sidecar';
 import { SystemPromptTemplateSelectionModal } from './src/ui/SystemPromptTemplateSelectionModal';
+import { SPEAKER_MAPPING_VIEW_TYPE, SpeakerMappingView, SpeakerMappingViewState } from './src/ui/SpeakerMappingView';
+import {
+	createDefaultSpeakerMapping,
+	prepareSpeakerMappingSession,
+} from './src/services/speakerMapping';
+import { Participant } from './src/settings/types';
+import { VoiceProfileService } from './src/services/voiceProfiles';
 import { t } from './src/i18n';
 
 const AUDIO_MIME_BY_EXTENSION: Record<string, string> = {
@@ -26,6 +34,7 @@ const SUPPORTED_AUDIO_EXTENSIONS = new Set(Object.keys(AUDIO_MIME_BY_EXTENSION))
 interface ProcessAudioBlobOptions {
 	systemPromptOverride?: string;
 	context?: string;
+	participants?: Participant[];
 	saveRawWhenEditorEnabled?: boolean;
 	openResult?: boolean;
 }
@@ -35,17 +44,33 @@ interface StreamFileWriter {
 	flush: () => Promise<void>;
 }
 
+function formatTimestamp(seconds: number): string {
+	const safeSeconds = Math.max(0, seconds);
+	const totalSeconds = Math.floor(safeSeconds);
+	const h = Math.floor(totalSeconds / 3600);
+	const m = Math.floor((totalSeconds % 3600) / 60);
+	const s = totalSeconds % 60;
+	if (h > 0) {
+		return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+	}
+	return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
 export default class ObsidianAITranscriber extends Plugin {
 	settings: PluginSettings;
 	recorder: RecorderService;
 	transcriber: TranscriberService;
 	fileService: FileService;
 	editorService: EditorService;
+	sidecarService: SidecarService;
+	voiceProfileService: VoiceProfileService;
 	statusBarItem: HTMLElement;
 	private statusTextEl: HTMLElement;
+	private diarizationStatusBarItem: HTMLElement;
 	private cancelTaskBtn: HTMLButtonElement;
 	private activeTaskController: AbortController | null = null;
 	private progressNotice: Notice | null = null;
+	private latestSpeakerMappingSession: SpeakerMappingViewState | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -53,9 +78,12 @@ export default class ObsidianAITranscriber extends Plugin {
 		this.transcriber = new TranscriberService();
 		this.fileService = new FileService(this.app);
 		this.editorService = new EditorService();
+		this.sidecarService = new SidecarService(this.app, this.manifest.id);
+		this.voiceProfileService = new VoiceProfileService(this.app, this.manifest.id);
 
 		this.initStatusBar();
 		this.updateStatus(t('statusIdle'));
+		void this.refreshDiarizationStatusBar();
 
 		this.addRibbonIcon('microphone', 'Record Audio', () => {
 			new RecordModal(this.app, this).open();
@@ -66,6 +94,19 @@ export default class ObsidianAITranscriber extends Plugin {
 			name: 'Record Audio',
 			callback: () => {
 				new RecordModal(this.app, this).open();
+			},
+		});
+
+		this.registerView(
+			SPEAKER_MAPPING_VIEW_TYPE,
+			leaf => new SpeakerMappingView(leaf, this),
+		);
+
+		this.addCommand({
+			id: 'obsidian-ai-transcriber-show-speaker-mapping',
+			name: t('speakerMappingShowCommand'),
+			callback: async () => {
+				await this.showSpeakerMappingPanel(this.latestSpeakerMappingSession ?? undefined);
 			},
 		});
 
@@ -173,7 +214,11 @@ export default class ObsidianAITranscriber extends Plugin {
 								return;
 							}
 
-							const processFile = async (systemPromptOverride?: string, context?: string) => {
+							const processFile = async (
+								systemPromptOverride?: string,
+								context?: string,
+								participants: Participant[] = [],
+							) => {
 								const arrayBuffer = await this.app.vault.readBinary(file);
 								const mime = this.getMimeTypeForExtension(file.extension);
 								const blob = new Blob([arrayBuffer], { type: mime });
@@ -181,6 +226,7 @@ export default class ObsidianAITranscriber extends Plugin {
 								await this.processAudioBlob(blob, baseName, {
 									systemPromptOverride,
 									context,
+									participants,
 									saveRawWhenEditorEnabled: true,
 									openResult: true,
 								});
@@ -191,6 +237,7 @@ export default class ObsidianAITranscriber extends Plugin {
 									const selectedTemplateName =
 										typeof selection === 'object' && selection ? selection.name : selection;
 									const context = typeof selection === 'object' && selection ? selection.context : '';
+									const participants = typeof selection === 'object' && selection ? selection.participants : [];
 
 									if (!selectedTemplateName) {
 										new Notice(t('noticeTemplateSelectionCancelledTranscribe'));
@@ -205,7 +252,7 @@ export default class ObsidianAITranscriber extends Plugin {
 										return;
 									}
 
-									await processFile(selectedTemplate.prompt, context);
+									await processFile(selectedTemplate.prompt, context, participants);
 								}).open();
 								return;
 							}
@@ -228,6 +275,8 @@ export default class ObsidianAITranscriber extends Plugin {
 		this.cancelTaskBtn.style.display = 'none';
 		this.clearProgressNotice();
 		this.updateStatus(t('statusIdle'));
+		this.diarizationStatusBarItem?.remove();
+		this.sidecarService?.stop();
 		void this.transcriber.dispose();
 	}
 
@@ -242,6 +291,27 @@ export default class ObsidianAITranscriber extends Plugin {
 		this.cancelTaskBtn.style.fontSize = '12px';
 		this.cancelTaskBtn.style.display = 'none';
 		this.cancelTaskBtn.onclick = () => this.cancelActiveTask();
+
+		this.diarizationStatusBarItem = this.addStatusBarItem();
+		this.diarizationStatusBarItem.addClass('ai-transcriber-diarization-status');
+		this.diarizationStatusBarItem.setText('Diarization: checking');
+	}
+
+	public async refreshDiarizationStatusBar(status?: SidecarStatus): Promise<SidecarStatus> {
+		const resolvedStatus = status ?? await this.sidecarService.getStatus();
+		const label =
+			resolvedStatus.code === 'configured'
+				? 'Configured'
+				: resolvedStatus.code === 'error'
+					? 'Error'
+					: 'Not configured';
+		this.diarizationStatusBarItem.setText(`Diarization: ${label}`);
+		if (resolvedStatus.error) {
+			this.diarizationStatusBarItem.setAttr('title', resolvedStatus.error);
+		} else if (resolvedStatus.config?.pythonPath) {
+			this.diarizationStatusBarItem.setAttr('title', resolvedStatus.config.pythonPath);
+		}
+		return resolvedStatus;
 	}
 
 	private beginTask(initialStatus: string): AbortSignal {
@@ -279,6 +349,22 @@ export default class ObsidianAITranscriber extends Plugin {
 			(error as Error)?.name === 'AbortError' ||
 			((error as Error)?.message ?? '').toLowerCase().includes('aborted')
 		);
+	}
+
+	private throwIfAborted(signal?: AbortSignal): void {
+		if (signal?.aborted) {
+			throw this.createAbortError();
+		}
+	}
+
+	private createAbortError(): Error {
+		try {
+			return new DOMException('The operation was aborted.', 'AbortError');
+		} catch {
+			const err = new Error('The operation was aborted.');
+			err.name = 'AbortError';
+			return err;
+		}
 	}
 
 	private updateProgressNotice(message: string): void {
@@ -406,6 +492,125 @@ export default class ObsidianAITranscriber extends Plugin {
 		return editedPath;
 	}
 
+	private async showSpeakerMappingPanel(session?: SpeakerMappingViewState): Promise<void> {
+		let leaf: WorkspaceLeaf | null = this.app.workspace.getLeavesOfType(SPEAKER_MAPPING_VIEW_TYPE)[0] ?? null;
+		if (!leaf) {
+			leaf = this.app.workspace.getRightLeaf(false);
+			if (!leaf) {
+				throw new Error('Could not open speaker confirmation panel.');
+			}
+			await leaf.setViewState({ type: SPEAKER_MAPPING_VIEW_TYPE, active: true });
+		}
+		this.app.workspace.revealLeaf(leaf);
+		if (session) {
+			const view = leaf.view;
+			if (view instanceof SpeakerMappingView) {
+				await view.setSession(session);
+			}
+		}
+	}
+
+	private async confirmSpeakersInRawNote(
+		rawPath: string,
+		transcript: string,
+		participants: Participant[],
+		analyses: SpeakerAnalysis[],
+		recordingId: string,
+		signal: AbortSignal,
+	): Promise<string> {
+		const session = prepareSpeakerMappingSession(transcript);
+		if (!session) {
+			return transcript;
+		}
+
+		await this.fileService.updateText(rawPath, session.text);
+		await this.fileService.openFile(rawPath);
+
+		return new Promise<string>((resolve, reject) => {
+			if (signal.aborted) {
+				reject(this.createAbortError());
+				return;
+			}
+			const onAbort = () => {
+				this.latestSpeakerMappingSession = null;
+				reject(this.createAbortError());
+			};
+			signal.addEventListener('abort', onAbort, { once: true });
+			void this.voiceProfileService.suggestMapping(analyses, participants).then(suggestedMapping => {
+				if (signal.aborted) {
+					reject(this.createAbortError());
+					return;
+				}
+				const viewState: SpeakerMappingViewState = {
+					rawPath,
+					speakerIds: session.speakerIds,
+					participants,
+					mapping: {
+						...createDefaultSpeakerMapping(session.speakerIds, []),
+						...suggestedMapping,
+					},
+					onConfirm: text => {
+						signal.removeEventListener('abort', onAbort);
+						this.latestSpeakerMappingSession = null;
+						void this.voiceProfileService.learnFromConfirmedMapping(recordingId, analyses, viewState.mapping);
+						resolve(text);
+					},
+				};
+				this.latestSpeakerMappingSession = viewState;
+				void this.showSpeakerMappingPanel(viewState);
+			}).catch(error => {
+				signal.removeEventListener('abort', onAbort);
+				reject(error);
+			});
+		});
+	}
+
+	private async tryAnalyzeSpeakers(blob: Blob, baseName: string, signal: AbortSignal): Promise<SpeakerAnalysis[]> {
+		const status = await this.sidecarService.getStatus();
+		if (status.code !== 'configured') {
+			return [];
+		}
+
+		this.throwIfAborted(signal);
+		this.updateStatus(t('statusDiarizing'));
+		this.updateProgressNotice(t('statusDiarizing'));
+
+		try {
+			return await this.sidecarService.analyzeSpeakers(blob, `${baseName}.webm`, message => {
+				this.updateProgressNotice(`${t('statusDiarizing')}\n${message}`);
+			});
+		} catch (error) {
+			if (this.isAbortError(error)) throw error;
+			console.warn('[AI Transcriber] Local diarization failed, falling back to standard transcription.', error);
+			new Notice(t('noticeDiarizationUnavailable'));
+			return [];
+		}
+	}
+
+	private getSegmentsFromAnalyses(analyses: SpeakerAnalysis[]): DiarizationSegment[] {
+		return analyses.flatMap(analysis => analysis.segments);
+	}
+
+	private buildDiarizationTimeline(segments: DiarizationSegment[]): string {
+		if (!segments.length) return '';
+		const lines = [
+			'### Speaker Timeline',
+			'',
+			...segments.map(segment => {
+				const start = formatTimestamp(segment.start);
+				const end = formatTimestamp(segment.end);
+				return `[${start} - ${end}] <!-- speaker:${segment.speaker} --> ${segment.speaker}:`;
+			}),
+		];
+		return lines.join('\n');
+	}
+
+	private combineDiarizationAndTranscript(segments: DiarizationSegment[], transcript: string): string {
+		const timeline = this.buildDiarizationTimeline(segments);
+		if (!timeline) return transcript;
+		return `${timeline}\n\n---\n\n### ASR Transcript\n\n${transcript.trim()}`;
+	}
+
 	public async processAudioBlob(
 		blob: Blob,
 		baseName: string,
@@ -422,6 +627,7 @@ export default class ObsidianAITranscriber extends Plugin {
 		const {
 			systemPromptOverride,
 			context,
+			participants = [],
 			saveRawWhenEditorEnabled = true,
 			openResult = true,
 		} = options || {};
@@ -430,7 +636,12 @@ export default class ObsidianAITranscriber extends Plugin {
 		let editedPath: string | undefined;
 
 		try {
-			const transcript = await this.transcriber.transcribe(blob, this.settings.transcriber, {
+			const speakerAnalyses = await this.tryAnalyzeSpeakers(blob, baseName, signal);
+			const diarizationSegments = this.getSegmentsFromAnalyses(speakerAnalyses);
+			this.updateStatus(t('statusTranscribing'));
+			this.updateProgressNotice(t('noticeTranscribingAudio'));
+
+			let transcript = await this.transcriber.transcribe(blob, this.settings.transcriber, {
 				context,
 				signal,
 				onProgress: progress => {
@@ -439,14 +650,23 @@ export default class ObsidianAITranscriber extends Plugin {
 					this.updateProgressNotice(message);
 				},
 			});
+			transcript = this.combineDiarizationAndTranscript(diarizationSegments, transcript);
 
 			const dir = this.settings.transcriber.transcriptDir;
 			const shouldEdit = this.settings.editor.enabled && systemPromptOverride !== undefined;
+			const rawFileName = `${baseName}_raw_transcript.md`;
 
-			if (!shouldEdit || saveRawWhenEditorEnabled) {
-				const rawFileName = `${baseName}_raw_transcript.md`;
+			if (!shouldEdit || saveRawWhenEditorEnabled || prepareSpeakerMappingSession(transcript)) {
 				rawPath = await this.fileService.saveTextWithName(transcript, dir, rawFileName);
 				new Notice(t('noticeRawTranscriptSaved', { path: rawPath }));
+				transcript = await this.confirmSpeakersInRawNote(
+					rawPath,
+					transcript,
+					participants,
+					speakerAnalyses,
+					baseName,
+					signal,
+				);
 			}
 
 			if (shouldEdit) {
@@ -501,6 +721,7 @@ export default class ObsidianAITranscriber extends Plugin {
 					savedData?.editor?.systemPromptTemplates ??
 					DEFAULT_SETTINGS.editor.systemPromptTemplates,
 			},
+			diarization: { ...DEFAULT_SETTINGS.diarization, ...savedData?.diarization },
 		};
 	}
 
