@@ -26,6 +26,45 @@ export interface TranscribeOptions {
 	onProgress?: (progress: TranscriptionProgress) => void;
 }
 
+export interface DiarizedTranscriptSegment {
+	speakerId: string;
+	startSec: number;
+	endSec: number;
+	text: string;
+	confidence?: 'high' | 'medium' | 'low';
+}
+
+export interface GeminiDiarizedTranscript {
+	speakers: DiscoveredSpeaker[];
+	timeline: SpeakerTimelineSegment[];
+	segments: DiarizedTranscriptSegment[];
+}
+
+export interface DiscoveredSpeaker {
+	id: string;
+	voiceDescription?: string;
+	candidateName?: string | null;
+}
+
+export interface SpeakerTimelineSegment {
+	speakerId: string;
+	startSec: number;
+	endSec: number;
+	confidence?: 'high' | 'medium' | 'low';
+}
+
+interface TimedAudioChunk {
+	blob: Blob;
+	startSec: number;
+	endSec: number;
+}
+
+interface GeminiUploadedFile {
+	name?: string;
+	uri?: string;
+	state?: string;
+}
+
 interface WorkerPreprocessOptions {
 	trimLongSilence: boolean;
 	minSilenceTrimSamples: number;
@@ -88,6 +127,475 @@ export class TranscriberService {
 		}
 
 		throw new Error(`Unsupported transcription provider: ${settings.provider}`);
+	}
+
+	async transcribeWithGeminiDiarization(
+		blob: Blob,
+		settings: TranscriberSettings,
+		options: TranscribeOptions = {},
+	): Promise<GeminiDiarizedTranscript> {
+		if (settings.provider !== 'gemini') {
+			throw new Error('Gemini diarization requires Gemini as the transcription provider.');
+		}
+		if (!settings.apiKey) {
+			throw new Error('Transcriber API key is not configured');
+		}
+
+		const { GoogleGenAI, Type } = await import('@google/genai');
+		const genAI = new GoogleGenAI({ apiKey: settings.apiKey });
+		const mimeType = blob.type || 'audio/webm';
+		let uploadedFullAudio: GeminiUploadedFile | null = null;
+
+		try {
+			this.emitProgress(options, { provider: 'gemini', stage: 'upload', currentChunk: 1, totalChunks: 1 });
+			uploadedFullAudio = await this.uploadGeminiFile(genAI, blob, mimeType, 'full audio', options.signal);
+			uploadedFullAudio = await this.waitForGeminiFileReady(genAI, uploadedFullAudio, 1, 1, options);
+
+			this.emitProgress(options, { provider: 'gemini', stage: 'transcribe', currentChunk: 1, totalChunks: 1 });
+			const discovery = await this.discoverGeminiSpeakers(
+				genAI,
+				uploadedFullAudio,
+				mimeType,
+				settings,
+				Type,
+				options,
+			);
+
+			this.emitProgress(options, { provider: 'gemini', stage: 'preprocess' });
+			const chunks = await this.preprocessForGeminiWithOffsets(blob, 15 * 60, options);
+			if (!chunks.length) {
+				return { ...discovery, segments: [] };
+			}
+
+			let completedChunks = 0;
+			const chunkSegments = await this.mapWithConcurrency(
+				chunks,
+				2,
+				options.signal,
+				async (chunk, index, workerSignal) => {
+					const chunkIndex = index + 1;
+					const chunkMimeType = chunk.blob.type || 'audio/wav';
+					let uploadedChunk: GeminiUploadedFile | null = null;
+					try {
+						this.emitProgress(options, {
+							provider: 'gemini',
+							stage: 'upload',
+							currentChunk: chunkIndex,
+							totalChunks: chunks.length,
+							completedChunks,
+						});
+						uploadedChunk = await this.uploadGeminiFile(
+							genAI,
+							chunk.blob,
+							chunkMimeType,
+							`chunk ${chunkIndex}/${chunks.length}`,
+							workerSignal,
+						);
+						uploadedChunk = await this.waitForGeminiFileReady(genAI, uploadedChunk, chunkIndex, chunks.length, {
+							...options,
+							signal: workerSignal,
+						});
+
+						this.emitProgress(options, {
+							provider: 'gemini',
+							stage: 'transcribe',
+							currentChunk: chunkIndex,
+							totalChunks: chunks.length,
+							completedChunks,
+						});
+						const segments = await this.transcribeGeminiChunk(
+							genAI,
+							uploadedChunk,
+							chunkMimeType,
+							chunk,
+							discovery,
+							settings,
+							Type,
+							{ ...options, signal: workerSignal },
+						);
+						completedChunks++;
+						this.emitProgress(options, {
+							provider: 'gemini',
+							stage: 'transcribe',
+							currentChunk: chunkIndex,
+							totalChunks: chunks.length,
+							completedChunks,
+						});
+						return segments;
+					} finally {
+						if (uploadedChunk?.name) {
+							await this.deleteGeminiFile(genAI, uploadedChunk, workerSignal);
+						}
+					}
+				},
+			);
+
+			const rawSegments = chunkSegments.flat().sort((a, b) => a.startSec - b.startSec);
+			const segments = this.assignSpeakersFromTimeline(rawSegments, discovery.timeline);
+			this.emitProgress(options, { provider: 'gemini', stage: 'done', totalChunks: chunks.length, completedChunks });
+			return { ...discovery, segments };
+		} finally {
+			if (uploadedFullAudio?.name) {
+				await this.deleteGeminiFile(genAI, uploadedFullAudio, options.signal);
+			}
+		}
+	}
+
+	private async uploadGeminiFile(
+		genAI: { files: { upload: (params: { file: Blob; config: { mimeType: string; abortSignal?: AbortSignal } }) => Promise<GeminiUploadedFile> } },
+		blob: Blob,
+		mimeType: string,
+		label: string,
+		signal?: AbortSignal,
+	): Promise<GeminiUploadedFile> {
+		const uploadedFile = await this.withRetries(
+			async () => {
+				this.throwIfAborted(signal);
+				return await genAI.files.upload({
+					file: blob,
+					config: {
+						mimeType,
+						abortSignal: signal,
+					},
+				});
+			},
+			{ label: `Gemini upload ${label}`, signal },
+		);
+		if (!uploadedFile?.name || !uploadedFile?.uri) {
+			throw new Error(`Gemini File API upload failed for ${label}: no file URI returned`);
+		}
+		return uploadedFile;
+	}
+
+	private async deleteGeminiFile(
+		genAI: { files: { delete: (params: { name: string; config?: { abortSignal?: AbortSignal } }) => Promise<unknown> } },
+		file: GeminiUploadedFile,
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (!file.name) return;
+		try {
+			await genAI.files.delete({ name: file.name, config: { abortSignal: signal } });
+		} catch (error) {
+			if (!this.isAbortError(error)) {
+				console.warn('[AI Transcriber] Failed to delete uploaded Gemini file:', error);
+			}
+		}
+	}
+
+	private async discoverGeminiSpeakers(
+		genAI: { models: { generateContent: (params: unknown) => Promise<{ text?: string }> } },
+		uploadedFile: GeminiUploadedFile,
+		mimeType: string,
+		settings: TranscriberSettings,
+		Type: Record<string, string>,
+		options: TranscribeOptions,
+	): Promise<{ speakers: DiscoveredSpeaker[]; timeline: SpeakerTimelineSegment[] }> {
+		const prompt =
+			'Listen to the entire audio and identify the distinct speakers.\n' +
+			'Do NOT transcribe the spoken content. Only output speaker identities and their time ranges.\n\n' +
+			'Rules:\n' +
+			'1. Assign stable IDs exactly as SPEAKER_00, SPEAKER_01, SPEAKER_02, etc.\n' +
+			'2. The same voice MUST use the same ID throughout the entire audio.\n' +
+			'3. The timeline must be a sequence of many speaking turns, not one range per speaker.\n' +
+			'4. Use absolute timestamps from the start of the full audio in HH:MM:SS or MM:SS.\n' +
+			'5. If two speakers overlap, choose the dominant speaker for that time range.\n' +
+			'6. Keep timeline segments reasonably granular around speaker changes.\n' +
+			'7. If candidate participant context is present, put a candidate name only when highly confident; otherwise omit candidateName or use an empty string.\n' +
+			'8. Return JSON only.';
+
+		const response = await genAI.models.generateContent({
+			model: settings.model,
+			contents: [
+				{
+					role: 'user',
+					parts: [{ text: this.withContext(prompt, options.context) }, { fileData: { fileUri: uploadedFile.uri!, mimeType } }],
+				},
+			],
+			config: {
+				temperature: 0,
+				maxOutputTokens: 8192,
+				responseMimeType: 'application/json',
+				responseSchema: this.getSpeakerDiscoverySchema(Type),
+				abortSignal: options.signal,
+			},
+		});
+
+		const parsed = this.parseJsonResponse(response.text, 'Gemini speaker discovery');
+		const speakers = this.normalizeDiscoveredSpeakers(parsed.speakers);
+		const timeline = this.normalizeSpeakerTimeline(parsed.timeline);
+		if (!speakers.length || !timeline.length) {
+			throw new Error('Gemini speaker discovery returned no usable speakers or timeline.');
+		}
+		return { speakers, timeline };
+	}
+
+	private async transcribeGeminiChunk(
+		genAI: { models: { generateContent: (params: unknown) => Promise<{ text?: string }> } },
+		uploadedFile: GeminiUploadedFile,
+		mimeType: string,
+		chunk: TimedAudioChunk,
+		discovery: { speakers: DiscoveredSpeaker[]; timeline: SpeakerTimelineSegment[] },
+		settings: TranscriberSettings,
+		Type: Record<string, string>,
+		options: TranscribeOptions,
+	): Promise<DiarizedTranscriptSegment[]> {
+		const chunkTimeline = discovery.timeline
+			.filter(segment => segment.endSec >= chunk.startSec - 1 && segment.startSec <= chunk.endSec + 1)
+			.map(segment => ({
+				speakerId: segment.speakerId,
+				start: this.formatHms(Math.max(0, segment.startSec - chunk.startSec)),
+				end: this.formatHms(Math.max(0, segment.endSec - chunk.startSec)),
+			}));
+		const speakerDefinitions = discovery.speakers
+			.map(speaker => `- ${speaker.id}: ${speaker.voiceDescription || 'distinct voice'}${speaker.candidateName ? `; possible name: ${speaker.candidateName}` : ''}`)
+			.join('\n');
+		const timelineHint = JSON.stringify(chunkTimeline, null, 2);
+		const prompt =
+			`Transcribe this audio chunk verbatim. This chunk starts at ${this.formatHms(chunk.startSec)} in the original full audio.\n\n` +
+			`Known speakers from full-audio discovery:\n${speakerDefinitions}\n\n` +
+			`Speaker timeline for this chunk, with timestamps relative to this chunk:\n${timelineHint}\n\n` +
+			'Rules:\n' +
+			'1. Output speech in the original spoken language. Do not translate and do not summarize.\n' +
+			'2. Return short transcript segments with timestamps relative to this chunk.\n' +
+			'3. Use speakerId from the known speaker list when it is clear from the timeline.\n' +
+			'4. If a segment spans a speaker change, split it into smaller segments.\n' +
+			'5. If you clearly hear a completely new voice that matches none of the known speakers, use SPEAKER_UNKNOWN.\n' +
+			'6. Return JSON only.';
+
+		const response = await genAI.models.generateContent({
+			model: settings.model,
+			contents: [
+				{
+					role: 'user',
+					parts: [{ text: this.withContext(prompt, options.context) }, { fileData: { fileUri: uploadedFile.uri!, mimeType } }],
+				},
+			],
+			config: {
+				temperature: 0,
+				maxOutputTokens: 65536,
+				responseMimeType: 'application/json',
+				responseSchema: this.getChunkTranscriptSchema(Type),
+				abortSignal: options.signal,
+			},
+		});
+
+		const parsed = this.parseJsonResponse(response.text, 'Gemini chunk transcription');
+		if (!Array.isArray(parsed.segments)) return [];
+		return parsed.segments
+			.map((item: unknown) => {
+				const raw = item as { speakerId?: unknown; start?: unknown; end?: unknown; text?: unknown };
+				const relativeStart = this.parseTimestamp(String(raw.start ?? ''));
+				const relativeEnd = this.parseTimestamp(String(raw.end ?? ''));
+				const text = String(raw.text ?? '').trim();
+				return {
+					speakerId: String(raw.speakerId || 'SPEAKER_UNKNOWN'),
+					startSec: chunk.startSec + relativeStart,
+					endSec: chunk.startSec + relativeEnd,
+					text,
+				} as DiarizedTranscriptSegment;
+			})
+			.filter((segment: DiarizedTranscriptSegment) => segment.text && Number.isFinite(segment.startSec) && Number.isFinite(segment.endSec))
+			.map((segment: DiarizedTranscriptSegment) => segment.endSec > segment.startSec ? segment : { ...segment, endSec: segment.startSec + 1 });
+	}
+
+	private getSpeakerDiscoverySchema(Type: Record<string, string>): unknown {
+		return {
+			type: Type.OBJECT,
+			properties: {
+				speakers: {
+					type: Type.ARRAY,
+					items: {
+						type: Type.OBJECT,
+						properties: {
+							id: { type: Type.STRING },
+							voiceDescription: { type: Type.STRING },
+							candidateName: { type: Type.STRING },
+						},
+						required: ['id'],
+					},
+				},
+				timeline: {
+					type: Type.ARRAY,
+					items: {
+						type: Type.OBJECT,
+						properties: {
+							speakerId: { type: Type.STRING },
+							start: { type: Type.STRING },
+							end: { type: Type.STRING },
+							confidence: { type: Type.STRING },
+						},
+						required: ['speakerId', 'start', 'end'],
+					},
+				},
+			},
+			required: ['speakers', 'timeline'],
+		};
+	}
+
+	private getChunkTranscriptSchema(Type: Record<string, string>): unknown {
+		return {
+			type: Type.OBJECT,
+			properties: {
+				segments: {
+					type: Type.ARRAY,
+					items: {
+						type: Type.OBJECT,
+						properties: {
+							speakerId: { type: Type.STRING },
+							start: { type: Type.STRING },
+							end: { type: Type.STRING },
+							text: { type: Type.STRING },
+						},
+						required: ['speakerId', 'start', 'end', 'text'],
+					},
+				},
+			},
+			required: ['segments'],
+		};
+	}
+
+	private parseJsonResponse(text: unknown, label: string): any {
+		if (typeof text !== 'string' || !text.trim()) {
+			throw new Error(`${label} returned no text content.`);
+		}
+		const trimmed = text.trim()
+			.replace(/^```(?:json)?\s*/i, '')
+			.replace(/\s*```$/i, '');
+		try {
+			return JSON.parse(trimmed);
+		} catch (error) {
+			throw new Error(`${label} returned invalid JSON: ${(error as Error).message}`);
+		}
+	}
+
+	private normalizeDiscoveredSpeakers(value: unknown): DiscoveredSpeaker[] {
+		if (!Array.isArray(value)) return [];
+		const seen = new Set<string>();
+		const speakers: DiscoveredSpeaker[] = [];
+		for (const item of value) {
+				const raw = item as { id?: unknown; voiceDescription?: unknown; candidateName?: unknown };
+				const id = this.normalizeSpeakerId(String(raw.id || ''));
+				if (!id || seen.has(id)) continue;
+				seen.add(id);
+				const candidateName = typeof raw.candidateName === 'string' && raw.candidateName.trim()
+					? raw.candidateName.trim()
+					: null;
+				speakers.push({
+					id,
+					voiceDescription: typeof raw.voiceDescription === 'string' ? raw.voiceDescription.trim() : undefined,
+					candidateName,
+				});
+		}
+		return speakers;
+	}
+
+	private normalizeSpeakerTimeline(value: unknown): SpeakerTimelineSegment[] {
+		if (!Array.isArray(value)) return [];
+		return value
+			.map(item => {
+				const raw = item as { speakerId?: unknown; start?: unknown; end?: unknown; confidence?: unknown };
+				const speakerId = this.normalizeSpeakerId(String(raw.speakerId || ''));
+				const startSec = this.parseTimestamp(String(raw.start ?? ''));
+				const endSec = this.parseTimestamp(String(raw.end ?? ''));
+				const confidence: 'high' | 'medium' | 'low' =
+					raw.confidence === 'medium' || raw.confidence === 'low' ? raw.confidence : 'high';
+				return { speakerId, startSec, endSec, confidence };
+			})
+			.filter(item => item.speakerId && Number.isFinite(item.startSec) && Number.isFinite(item.endSec) && item.endSec > item.startSec)
+			.sort((a, b) => a.startSec - b.startSec);
+	}
+
+	private normalizeSpeakerId(value: string): string {
+		const upper = value.trim().toUpperCase().replace(/\s+/g, '_');
+		const direct = upper.match(/^SPEAKER_(\d+)$/);
+		if (direct) {
+			return `SPEAKER_${direct[1].padStart(2, '0')}`;
+		}
+		const numbered = upper.match(/^SPEAKER[_-]?(\d+)$/);
+		if (numbered) {
+			return `SPEAKER_${numbered[1].padStart(2, '0')}`;
+		}
+		return upper.startsWith('SPEAKER_') ? upper : '';
+	}
+
+	private parseTimestamp(value: string): number {
+		const cleaned = value.trim();
+		if (!cleaned) return Number.NaN;
+		if (/^\d+(?:\.\d+)?$/.test(cleaned)) {
+			return Number(cleaned);
+		}
+		const parts = cleaned.split(':').map(part => Number(part));
+		if (parts.some(part => !Number.isFinite(part))) {
+			return Number.NaN;
+		}
+		if (parts.length === 2) {
+			return parts[0] * 60 + parts[1];
+		}
+		if (parts.length === 3) {
+			return parts[0] * 3600 + parts[1] * 60 + parts[2];
+		}
+		return Number.NaN;
+	}
+
+	private formatHms(seconds: number): string {
+		const safeSeconds = Math.max(0, seconds);
+		const whole = Math.floor(safeSeconds);
+		const h = Math.floor(whole / 3600);
+		const m = Math.floor((whole % 3600) / 60);
+		const s = whole % 60;
+		return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+	}
+
+	private withContext(prompt: string, context?: string): string {
+		if (!context?.trim()) return prompt;
+		return `${prompt}\n\nMeeting context for recognition only:\n${context.trim()}\n\nDo not add context that is not spoken in the audio.`;
+	}
+
+	private assignSpeakersFromTimeline(
+		segments: DiarizedTranscriptSegment[],
+		timeline: SpeakerTimelineSegment[],
+	): DiarizedTranscriptSegment[] {
+		return segments.map(segment => {
+			const assignment = this.findBestTimelineSpeaker(segment, timeline);
+			return {
+				...segment,
+				speakerId: assignment.speakerId || segment.speakerId || 'SPEAKER_UNKNOWN',
+				confidence: assignment.confidence,
+			};
+		});
+	}
+
+	private findBestTimelineSpeaker(
+		segment: DiarizedTranscriptSegment,
+		timeline: SpeakerTimelineSegment[],
+	): { speakerId: string; confidence: 'high' | 'medium' | 'low' } {
+		const boundaryTolerance = 0.75;
+		const duration = Math.max(0.25, segment.endSec - segment.startSec);
+		const overlaps = new Map<string, number>();
+		for (const turn of timeline) {
+			const start = Math.max(segment.startSec, turn.startSec - boundaryTolerance);
+			const end = Math.min(segment.endSec, turn.endSec + boundaryTolerance);
+			const overlap = Math.max(0, end - start);
+			if (overlap > 0) {
+				overlaps.set(turn.speakerId, (overlaps.get(turn.speakerId) ?? 0) + overlap);
+			}
+		}
+
+		const ranked = Array.from(overlaps.entries()).sort((a, b) => b[1] - a[1]);
+		if (!ranked.length || ranked[0][1] < 0.35) {
+			return { speakerId: segment.speakerId || 'SPEAKER_UNKNOWN', confidence: 'low' };
+		}
+
+		const [speakerId, best] = ranked[0];
+		const second = ranked[1]?.[1] ?? 0;
+		const ratio = best / duration;
+		if (ratio < 0.55 || best - second < 0.5) {
+			return { speakerId, confidence: 'low' };
+		}
+		if (ratio < 0.7 || best - second < 1) {
+			return { speakerId, confidence: 'medium' };
+		}
+		return { speakerId, confidence: 'high' };
 	}
 
 	private normalizeOptions(contextOrOptions?: string | TranscribeOptions): TranscribeOptions {
@@ -578,6 +1086,30 @@ export class TranscriberService {
 		return chunks;
 	}
 
+	private async preprocessForGeminiWithOffsets(
+		blob: Blob,
+		maxDurationSeconds: number,
+		options: TranscribeOptions,
+	): Promise<TimedAudioChunk[]> {
+		console.info('[AI Transcriber] Gemini diarization preprocess start.', { maxDurationSeconds, sizeBytes: blob.size });
+		const data = await this.decodeAndResample(blob, options.signal);
+		const chunks = this.splitAtSilenceToTimedWav(data, {
+			trimLongSilence: false,
+			minSilenceTrimSamples: 0,
+			maxDurationSeconds,
+			targetSampleRate: TARGET_SAMPLE_RATE,
+			silenceThreshold: SILENCE_THRESHOLD,
+			silenceWindowSeconds: SILENCE_WINDOW_SECONDS,
+			searchRangeSeconds: SEARCH_RANGE_SECONDS,
+			minChunkSeconds: MIN_CHUNK_SECONDS,
+		}, options.signal);
+		console.info('[AI Transcriber] Gemini diarization preprocess done.', {
+			chunks: chunks.length,
+			ranges: chunks.map(chunk => [chunk.startSec, chunk.endSec]),
+		});
+		return chunks;
+	}
+
 	/**
 	 * OpenAI preprocessing: resample, trim silence, chunk at silence boundaries.
 	 */
@@ -988,6 +1520,53 @@ function writeString(view, offset, value) {
 			if (segmentSamples >= minChunkSamples) {
 				const wav = this.float32ToWavBuffer(data.subarray(startSample, endSample), options.targetSampleRate);
 				chunks.push(new Blob([wav], { type: 'audio/wav' }));
+			}
+
+			startSample = endSample;
+		}
+
+		return chunks;
+	}
+
+	private splitAtSilenceToTimedWav(
+		data: Float32Array,
+		options: WorkerPreprocessOptions,
+		signal?: AbortSignal,
+	): TimedAudioChunk[] {
+		const maxSamples = Math.floor(options.maxDurationSeconds * options.targetSampleRate);
+		const minChunkSamples = Math.floor(options.minChunkSeconds * options.targetSampleRate);
+		const silenceWindowSamples = Math.floor(options.silenceWindowSeconds * options.targetSampleRate);
+		const searchRangeSamples = Math.floor(options.searchRangeSeconds * options.targetSampleRate);
+		const totalSamples = data.length;
+		const chunks: TimedAudioChunk[] = [];
+
+		let startSample = 0;
+		while (startSample < totalSamples) {
+			this.throwIfAborted(signal);
+			let endSample = Math.min(startSample + maxSamples, totalSamples);
+
+			if (endSample < totalSamples) {
+				const splitPoint = this.findSilenceSplitPoint(
+					data,
+					endSample,
+					totalSamples,
+					silenceWindowSamples,
+					searchRangeSamples,
+					options.silenceThreshold,
+				);
+				if (splitPoint !== null && splitPoint > startSample) {
+					endSample = splitPoint;
+				}
+			}
+
+			const segmentSamples = endSample - startSample;
+			if (segmentSamples >= minChunkSamples) {
+				const wav = this.float32ToWavBuffer(data.subarray(startSample, endSample), options.targetSampleRate);
+				chunks.push({
+					blob: new Blob([wav], { type: 'audio/wav' }),
+					startSec: startSample / options.targetSampleRate,
+					endSec: endSample / options.targetSampleRate,
+				});
 			}
 
 			startSample = endSample;

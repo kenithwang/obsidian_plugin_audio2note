@@ -39,7 +39,7 @@ export interface EditorSettings {
 }
 
 export interface DiarizationSettings {
-	mode: 'local-python';
+	mode: 'gemini' | 'local-python';
 	fallbackToLlm: boolean;
 }
 
@@ -78,7 +78,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 		keepOriginal: true,
 	},
 	diarization: {
-		mode: 'local-python',
+		mode: 'gemini',
 		fallbackToLlm: true,
 	},
 };

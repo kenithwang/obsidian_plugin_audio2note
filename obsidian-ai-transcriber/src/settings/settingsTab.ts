@@ -46,6 +46,27 @@ export default class SettingsTab extends PluginSettingTab {
 	private renderDiarizationSettings(containerEl: HTMLElement): void {
 		containerEl.createEl('h2', { text: t('diarizationSettingsTitle') });
 
+		new Setting(containerEl)
+			.setName('Speaker diarization mode')
+			.setDesc('Gemini cloud mode does not download local Python, PyTorch, or Hugging Face models.')
+			.addDropdown(dropdown => dropdown
+				.addOption('gemini', 'Gemini cloud (recommended)')
+				.addOption('local-python', 'Local pyannote sidecar (experimental)')
+				.setValue(this.plugin.settings.diarization.mode)
+				.onChange(async value => {
+					this.plugin.settings.diarization.mode = value as 'gemini' | 'local-python';
+					await this.flushPendingSave();
+					await this.plugin.refreshDiarizationStatusBar();
+					this.display();
+				}));
+
+		if (this.plugin.settings.diarization.mode === 'gemini') {
+			new Setting(containerEl)
+				.setName(t('diarizationStatusName'))
+				.setDesc('Configured: Gemini two-phase speaker timeline is used when Gemini is selected and participants are chosen before transcription.');
+			return;
+		}
+
 		const statusSetting = new Setting(containerEl)
 			.setName(t('diarizationStatusName'))
 			.setDesc(t('diarizationStatusChecking'));

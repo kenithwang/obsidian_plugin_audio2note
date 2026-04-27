@@ -4,7 +4,7 @@ import { RecorderService } from './src/services/recorder';
 import { FileService } from './src/services/file';
 import SettingsTab from './src/settings/settingsTab';
 import { PluginSettings, DEFAULT_SETTINGS } from './src/settings/types';
-import { TranscriberService, TranscriptionProgress } from './src/services/transcriber';
+import { DiarizedTranscriptSegment, GeminiDiarizedTranscript, TranscriberService, TranscriptionProgress } from './src/services/transcriber';
 import { EditProgress, EditorService } from './src/services/editor';
 import { DiarizationSegment, SidecarService, SidecarStatus, SpeakerAnalysis } from './src/services/sidecar';
 import { SystemPromptTemplateSelectionModal } from './src/ui/SystemPromptTemplateSelectionModal';
@@ -298,6 +298,14 @@ export default class ObsidianAITranscriber extends Plugin {
 	}
 
 	public async refreshDiarizationStatusBar(status?: SidecarStatus): Promise<SidecarStatus> {
+		if (this.settings.diarization.mode === 'gemini') {
+			this.diarizationStatusBarItem.setText('Diarization: Gemini');
+			this.diarizationStatusBarItem.setAttr('title', 'Gemini two-phase speaker diarization is configured. No local model download is used.');
+			return {
+				code: 'configured',
+				message: 'Gemini cloud diarization configured',
+			};
+		}
 		const resolvedStatus = status ?? await this.sidecarService.getStatus();
 		const label =
 			resolvedStatus.code === 'configured'
@@ -611,6 +619,53 @@ export default class ObsidianAITranscriber extends Plugin {
 		return `${timeline}\n\n---\n\n### ASR Transcript\n\n${transcript.trim()}`;
 	}
 
+	private buildGeminiDiarizedTranscript(result: GeminiDiarizedTranscript): string {
+		const speakerLines = result.speakers.length
+			? [
+				'### Speakers',
+				'',
+				...result.speakers.map(speaker => {
+					const description = speaker.voiceDescription ? ` - ${speaker.voiceDescription}` : '';
+					const candidate = speaker.candidateName ? ` (candidate: ${speaker.candidateName})` : '';
+					return `- ${speaker.id}${candidate}${description}`;
+				}),
+				'',
+			]
+			: [];
+		const timelineLines = result.timeline.length
+			? [
+				'### Speaker Timeline',
+				'',
+				...result.timeline.map(segment => {
+					const start = formatTimestamp(segment.startSec);
+					const end = formatTimestamp(segment.endSec);
+					const confidence = segment.confidence && segment.confidence !== 'high' ? ` confidence:${segment.confidence}` : '';
+					return `[${start} - ${end}] <!-- speaker:${segment.speakerId}${confidence} --> ${segment.speakerId}:`;
+				}),
+				'',
+			]
+			: [];
+		const transcriptLines = [
+			'### Transcript',
+			'',
+			...result.segments.map(segment => this.formatDiarizedTranscriptSegment(segment)),
+		];
+		return [...speakerLines, ...timelineLines, ...transcriptLines].join('\n').trim();
+	}
+
+	private formatDiarizedTranscriptSegment(segment: DiarizedTranscriptSegment): string {
+		const start = formatTimestamp(segment.startSec);
+		const end = formatTimestamp(segment.endSec);
+		const confidence = segment.confidence && segment.confidence !== 'high' ? ` confidence:${segment.confidence}` : '';
+		return `[${start} - ${end}] <!-- speaker:${segment.speakerId}${confidence} --> ${segment.speakerId}: ${segment.text}`;
+	}
+
+	private shouldUseGeminiDiarization(participants: Participant[]): boolean {
+		return this.settings.transcriber.provider === 'gemini'
+			&& this.settings.diarization.mode === 'gemini'
+			&& participants.length > 0;
+	}
+
 	public async processAudioBlob(
 		blob: Blob,
 		baseName: string,
@@ -636,21 +691,38 @@ export default class ObsidianAITranscriber extends Plugin {
 		let editedPath: string | undefined;
 
 		try {
-			const speakerAnalyses = await this.tryAnalyzeSpeakers(blob, baseName, signal);
-			const diarizationSegments = this.getSegmentsFromAnalyses(speakerAnalyses);
-			this.updateStatus(t('statusTranscribing'));
-			this.updateProgressNotice(t('noticeTranscribingAudio'));
+			let speakerAnalyses: SpeakerAnalysis[] = [];
+			let transcript: string;
+			if (this.shouldUseGeminiDiarization(participants)) {
+				this.updateStatus(t('statusDiarizing'));
+				this.updateProgressNotice(t('statusDiarizing'));
+				const diarized = await this.transcriber.transcribeWithGeminiDiarization(blob, this.settings.transcriber, {
+					context,
+					signal,
+					onProgress: progress => {
+						const message = this.getTranscriptionProgressText(progress);
+						this.updateStatus(message);
+						this.updateProgressNotice(message);
+					},
+				});
+				transcript = this.buildGeminiDiarizedTranscript(diarized);
+			} else {
+				speakerAnalyses = await this.tryAnalyzeSpeakers(blob, baseName, signal);
+				const diarizationSegments = this.getSegmentsFromAnalyses(speakerAnalyses);
+				this.updateStatus(t('statusTranscribing'));
+				this.updateProgressNotice(t('noticeTranscribingAudio'));
 
-			let transcript = await this.transcriber.transcribe(blob, this.settings.transcriber, {
-				context,
-				signal,
-				onProgress: progress => {
-					const message = this.getTranscriptionProgressText(progress);
-					this.updateStatus(message);
-					this.updateProgressNotice(message);
-				},
-			});
-			transcript = this.combineDiarizationAndTranscript(diarizationSegments, transcript);
+				transcript = await this.transcriber.transcribe(blob, this.settings.transcriber, {
+					context,
+					signal,
+					onProgress: progress => {
+						const message = this.getTranscriptionProgressText(progress);
+						this.updateStatus(message);
+						this.updateProgressNotice(message);
+					},
+				});
+				transcript = this.combineDiarizationAndTranscript(diarizationSegments, transcript);
+			}
 
 			const dir = this.settings.transcriber.transcriptDir;
 			const shouldEdit = this.settings.editor.enabled && systemPromptOverride !== undefined;

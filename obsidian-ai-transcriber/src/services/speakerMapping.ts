@@ -1,6 +1,6 @@
 import { Participant } from '../settings/types';
 
-export const SPEAKER_MARKER_PATTERN = /<!--\s*speaker:([A-Za-z0-9_-]+)\s*-->\s*([^:\n]+):/g;
+export const SPEAKER_MARKER_PATTERN = /<!--\s*speaker:([A-Za-z0-9_-]+)(?:\s+[^>]*)?-->\s*([^:\n]+):/g;
 
 export interface SpeakerMappingSession {
 	speakerIds: string[];
