@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { TranscriberSettings } from '../settings/types';
+import { ApiProvider, TranscriberSettings } from '../settings/types';
 
 const TARGET_SAMPLE_RATE = 16000;
 const SILENCE_THRESHOLD = 0.01;
@@ -9,11 +9,14 @@ const MIN_CHUNK_SECONDS = 1;
 const DEFAULT_TRANSCRIBE_CONCURRENCY = 3;
 const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
 const DIRECT_GEMINI_UPLOAD_MAX_BYTES = 20 * 1024 * 1024;
+const GEMINI_JSON_MAX_OUTPUT_TOKENS = 65536;
+const GEMINI_FULL_AUDIO_TRANSCRIPTION_MAX_SECONDS = 5 * 60;
+const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 type TranscriptionStage = 'preprocess' | 'upload' | 'processing' | 'transcribe' | 'done';
 
 export interface TranscriptionProgress {
-	provider: 'openai' | 'gemini';
+	provider: ApiProvider;
 	stage: TranscriptionStage;
 	currentChunk?: number;
 	totalChunks?: number;
@@ -22,6 +25,7 @@ export interface TranscriptionProgress {
 
 export interface TranscribeOptions {
 	context?: string;
+	durationSec?: number;
 	signal?: AbortSignal;
 	onProgress?: (progress: TranscriptionProgress) => void;
 }
@@ -63,6 +67,19 @@ interface GeminiUploadedFile {
 	name?: string;
 	uri?: string;
 	state?: string;
+}
+
+interface GeminiGenerateContentResponse {
+	text?: string;
+	candidates?: Array<{
+		finishReason?: string;
+		finishMessage?: string;
+	}>;
+	usageMetadata?: {
+		promptTokenCount?: number;
+		candidatesTokenCount?: number;
+		totalTokenCount?: number;
+	};
 }
 
 interface WorkerPreprocessOptions {
@@ -126,6 +143,10 @@ export class TranscriberService {
 			return this.transcribeWithGemini(blob, settings, options);
 		}
 
+		if (settings.provider === 'openrouter') {
+			return this.transcribeWithOpenRouter(blob, settings, options);
+		}
+
 		throw new Error(`Unsupported transcription provider: ${settings.provider}`);
 	}
 
@@ -141,28 +162,58 @@ export class TranscriberService {
 			throw new Error('Transcriber API key is not configured');
 		}
 
+		const mimeType = blob.type || 'audio/webm';
+		console.info('[AI Transcriber] Gemini diarization requested.', {
+			model: settings.model,
+			mimeType,
+			sizeBytes: blob.size,
+			hasContext: Boolean(options.context?.trim()),
+		});
+
 		const { GoogleGenAI, Type } = await import('@google/genai');
 		const genAI = new GoogleGenAI({ apiKey: settings.apiKey });
-		const mimeType = blob.type || 'audio/webm';
 		let uploadedFullAudio: GeminiUploadedFile | null = null;
 
-		try {
-			this.emitProgress(options, { provider: 'gemini', stage: 'upload', currentChunk: 1, totalChunks: 1 });
-			uploadedFullAudio = await this.uploadGeminiFile(genAI, blob, mimeType, 'full audio', options.signal);
-			uploadedFullAudio = await this.waitForGeminiFileReady(genAI, uploadedFullAudio, 1, 1, options);
+			try {
+				this.emitProgress(options, { provider: 'gemini', stage: 'upload', currentChunk: 1, totalChunks: 1 });
+				uploadedFullAudio = await this.uploadGeminiFile(genAI, blob, mimeType, 'full audio', options.signal);
+				uploadedFullAudio = await this.waitForGeminiFileReady(genAI, uploadedFullAudio, 1, 1, options);
 
-			this.emitProgress(options, { provider: 'gemini', stage: 'transcribe', currentChunk: 1, totalChunks: 1 });
-			const discovery = await this.discoverGeminiSpeakers(
-				genAI,
+				if (this.shouldUseGeminiShortFastPath(options)) {
+					console.info('[AI Transcriber] Gemini diarization using short-audio single-call path.', {
+						durationSec: options.durationSec,
+						thresholdSeconds: GEMINI_FULL_AUDIO_TRANSCRIPTION_MAX_SECONDS,
+					});
+					const result = await this.transcribeGeminiShortDiarization(
+						genAI,
+						uploadedFullAudio,
+						mimeType,
+						settings,
+						Type,
+						options,
+					);
+					this.emitProgress(options, { provider: 'gemini', stage: 'done', totalChunks: 1, completedChunks: 1 });
+					return result;
+				}
+
+				this.emitProgress(options, { provider: 'gemini', stage: 'transcribe', currentChunk: 1, totalChunks: 1 });
+				const discovery = await this.discoverGeminiSpeakers(
+					genAI,
 				uploadedFullAudio,
 				mimeType,
 				settings,
 				Type,
 				options,
 			);
+			const discoveredDurationSec = this.getSpeakerTimelineEndSec(discovery.timeline);
+				console.info('[AI Transcriber] Gemini speaker discovery complete.', {
+					speakers: discovery.speakers.length,
+					timelineSegments: discovery.timeline.length,
+					discoveredDurationSec,
+				});
 
-			this.emitProgress(options, { provider: 'gemini', stage: 'preprocess' });
-			const chunks = await this.preprocessForGeminiWithOffsets(blob, 15 * 60, options);
+				this.emitProgress(options, { provider: 'gemini', stage: 'preprocess' });
+				const chunks = await this.preprocessForGeminiWithOffsets(blob, 15 * 60, options);
 			if (!chunks.length) {
 				return { ...discovery, segments: [] };
 			}
@@ -222,11 +273,11 @@ export class TranscriberService {
 							completedChunks,
 						});
 						return segments;
-					} finally {
-						if (uploadedChunk?.name) {
-							await this.deleteGeminiFile(genAI, uploadedChunk, workerSignal);
+						} finally {
+							if (uploadedChunk?.name) {
+								await this.deleteGeminiFile(genAI, uploadedChunk);
+							}
 						}
-					}
 				},
 			);
 
@@ -234,11 +285,24 @@ export class TranscriberService {
 			const segments = this.assignSpeakersFromTimeline(rawSegments, discovery.timeline);
 			this.emitProgress(options, { provider: 'gemini', stage: 'done', totalChunks: chunks.length, completedChunks });
 			return { ...discovery, segments };
-		} finally {
-			if (uploadedFullAudio?.name) {
-				await this.deleteGeminiFile(genAI, uploadedFullAudio, options.signal);
+			} finally {
+				if (uploadedFullAudio?.name) {
+					await this.deleteGeminiFile(genAI, uploadedFullAudio);
+				}
 			}
 		}
+
+	private shouldUseGeminiShortFastPath(options: TranscribeOptions): boolean {
+		const durationSec = options.durationSec;
+		return typeof durationSec === 'number'
+			&& durationSec > 0
+			&& durationSec <= GEMINI_FULL_AUDIO_TRANSCRIPTION_MAX_SECONDS;
+	}
+
+	private getSpeakerTimelineEndSec(timeline: SpeakerTimelineSegment[]): number {
+		return Math.max(0, ...timeline
+			.map(segment => segment.endSec)
+			.filter(endSec => Number.isFinite(endSec)));
 	}
 
 	private async uploadGeminiFile(
@@ -248,18 +312,22 @@ export class TranscriberService {
 		label: string,
 		signal?: AbortSignal,
 	): Promise<GeminiUploadedFile> {
-		const uploadedFile = await this.withRetries(
-			async () => {
-				this.throwIfAborted(signal);
-				return await genAI.files.upload({
-					file: blob,
-					config: {
-						mimeType,
-						abortSignal: signal,
-					},
-				});
-			},
-			{ label: `Gemini upload ${label}`, signal },
+		const uploadedFile = await this.withTiming(
+			'Gemini upload',
+			{ label, mimeType, sizeBytes: blob.size },
+			() => this.withRetries(
+				async () => {
+					this.throwIfAborted(signal);
+					return await genAI.files.upload({
+						file: blob,
+						config: {
+							mimeType,
+							abortSignal: signal,
+						},
+					});
+				},
+				{ label: `Gemini upload ${label}`, signal },
+			),
 		);
 		if (!uploadedFile?.name || !uploadedFile?.uri) {
 			throw new Error(`Gemini File API upload failed for ${label}: no file URI returned`);
@@ -283,7 +351,7 @@ export class TranscriberService {
 	}
 
 	private async discoverGeminiSpeakers(
-		genAI: { models: { generateContent: (params: unknown) => Promise<{ text?: string }> } },
+		genAI: { models: { generateContent: (params: unknown) => Promise<GeminiGenerateContentResponse> } },
 		uploadedFile: GeminiUploadedFile,
 		mimeType: string,
 		settings: TranscriberSettings,
@@ -303,34 +371,107 @@ export class TranscriberService {
 			'7. If candidate participant context is present, put a candidate name only when highly confident; otherwise omit candidateName or use an empty string.\n' +
 			'8. Return JSON only.';
 
-		const response = await genAI.models.generateContent({
-			model: settings.model,
-			contents: [
-				{
-					role: 'user',
-					parts: [{ text: this.withContext(prompt, options.context) }, { fileData: { fileUri: uploadedFile.uri!, mimeType } }],
+			const parsed = await this.withRetries(
+				async () => {
+					const response = await this.withTiming(
+						'Gemini speaker discovery model call',
+						{ model: settings.model, mimeType },
+						() => genAI.models.generateContent({
+							model: settings.model,
+							contents: [
+								{
+									role: 'user',
+									parts: [{ text: this.withContext(prompt, options.context) }, { fileData: { fileUri: uploadedFile.uri!, mimeType } }],
+								},
+							],
+							config: {
+								temperature: 0,
+								maxOutputTokens: GEMINI_JSON_MAX_OUTPUT_TOKENS,
+								responseMimeType: 'application/json',
+								responseSchema: this.getSpeakerDiscoverySchema(Type),
+								abortSignal: options.signal,
+							},
+						}),
+					);
+					return this.parseJsonResponse(response.text, 'Gemini speaker discovery', response);
 				},
-			],
-			config: {
-				temperature: 0,
-				maxOutputTokens: 8192,
-				responseMimeType: 'application/json',
-				responseSchema: this.getSpeakerDiscoverySchema(Type),
-				abortSignal: options.signal,
+			{
+				label: 'Gemini speaker discovery',
+				signal: options.signal,
+				maxRetries: 3,
 			},
-		});
-
-		const parsed = this.parseJsonResponse(response.text, 'Gemini speaker discovery');
+		);
 		const speakers = this.normalizeDiscoveredSpeakers(parsed.speakers);
 		const timeline = this.normalizeSpeakerTimeline(parsed.timeline);
 		if (!speakers.length || !timeline.length) {
 			throw new Error('Gemini speaker discovery returned no usable speakers or timeline.');
+			}
+			return { speakers, timeline };
 		}
-		return { speakers, timeline };
+
+	private async transcribeGeminiShortDiarization(
+		genAI: { models: { generateContent: (params: unknown) => Promise<GeminiGenerateContentResponse> } },
+		uploadedFile: GeminiUploadedFile,
+		mimeType: string,
+		settings: TranscriberSettings,
+		Type: Record<string, string>,
+		options: TranscribeOptions,
+	): Promise<GeminiDiarizedTranscript> {
+		const prompt =
+			'Transcribe this short audio verbatim and identify the speakers in one pass.\n\n' +
+			'Rules:\n' +
+			'1. Output speech in the original spoken language. Do not translate and do not summarize.\n' +
+			'2. Assign stable speaker IDs exactly as SPEAKER_00, SPEAKER_01, SPEAKER_02, etc.\n' +
+			'3. If candidate participant context is present, put candidateName only when highly confident; otherwise omit it or use an empty string.\n' +
+			'4. Return short transcript segments with absolute timestamps from the start of the audio.\n' +
+			'5. Split segments whenever the speaker changes.\n' +
+			'6. Return JSON only.';
+
+		const parsed = await this.withRetries(
+			async () => {
+				const response = await this.withTiming(
+					'Gemini short diarization model call',
+					{ model: settings.model, mimeType, durationSec: options.durationSec },
+					() => genAI.models.generateContent({
+						model: settings.model,
+						contents: [
+							{
+								role: 'user',
+								parts: [{ text: this.withContext(prompt, options.context) }, { fileData: { fileUri: uploadedFile.uri!, mimeType } }],
+							},
+						],
+						config: {
+							temperature: 0,
+							maxOutputTokens: GEMINI_JSON_MAX_OUTPUT_TOKENS,
+							responseMimeType: 'application/json',
+							responseSchema: this.getShortDiarizedTranscriptSchema(Type),
+							abortSignal: options.signal,
+						},
+					}),
+				);
+				return this.parseJsonResponse(response.text, 'Gemini short diarization', response);
+			},
+			{
+				label: 'Gemini short diarization',
+				signal: options.signal,
+				maxRetries: 3,
+			},
+		);
+
+		const segments = this.normalizeGeminiTranscriptSegments(parsed.segments, 0);
+		let speakers = this.normalizeDiscoveredSpeakers(parsed.speakers);
+		if (!speakers.length) {
+			speakers = this.deriveSpeakersFromSegments(segments);
+		}
+		const timeline = this.buildTimelineFromTranscriptSegments(segments);
+		if (!speakers.length || !segments.length || !timeline.length) {
+			throw new Error('Gemini short diarization returned no usable transcript segments.');
+		}
+		return { speakers, timeline, segments };
 	}
 
-	private async transcribeGeminiChunk(
-		genAI: { models: { generateContent: (params: unknown) => Promise<{ text?: string }> } },
+		private async transcribeGeminiChunk(
+			genAI: { models: { generateContent: (params: unknown) => Promise<GeminiGenerateContentResponse> } },
 		uploadedFile: GeminiUploadedFile,
 		mimeType: string,
 		chunk: TimedAudioChunk,
@@ -362,41 +503,39 @@ export class TranscriberService {
 			'5. If you clearly hear a completely new voice that matches none of the known speakers, use SPEAKER_UNKNOWN.\n' +
 			'6. Return JSON only.';
 
-		const response = await genAI.models.generateContent({
-			model: settings.model,
-			contents: [
-				{
-					role: 'user',
-					parts: [{ text: this.withContext(prompt, options.context) }, { fileData: { fileUri: uploadedFile.uri!, mimeType } }],
+			const parsed = await this.withRetries(
+				async () => {
+					const response = await this.withTiming(
+						'Gemini chunk transcription model call',
+						{ model: settings.model, mimeType, startSec: chunk.startSec, endSec: chunk.endSec },
+						() => genAI.models.generateContent({
+							model: settings.model,
+							contents: [
+								{
+									role: 'user',
+									parts: [{ text: this.withContext(prompt, options.context) }, { fileData: { fileUri: uploadedFile.uri!, mimeType } }],
+								},
+							],
+							config: {
+								temperature: 0,
+								maxOutputTokens: GEMINI_JSON_MAX_OUTPUT_TOKENS,
+								responseMimeType: 'application/json',
+								responseSchema: this.getChunkTranscriptSchema(Type),
+								abortSignal: options.signal,
+							},
+						}),
+					);
+					return this.parseJsonResponse(response.text, 'Gemini chunk transcription', response);
 				},
-			],
-			config: {
-				temperature: 0,
-				maxOutputTokens: 65536,
-				responseMimeType: 'application/json',
-				responseSchema: this.getChunkTranscriptSchema(Type),
-				abortSignal: options.signal,
+			{
+				label: `Gemini chunk transcription ${this.formatHms(chunk.startSec)}-${this.formatHms(chunk.endSec)}`,
+				signal: options.signal,
+				maxRetries: 3,
 			},
-		});
-
-		const parsed = this.parseJsonResponse(response.text, 'Gemini chunk transcription');
-		if (!Array.isArray(parsed.segments)) return [];
-		return parsed.segments
-			.map((item: unknown) => {
-				const raw = item as { speakerId?: unknown; start?: unknown; end?: unknown; text?: unknown };
-				const relativeStart = this.parseTimestamp(String(raw.start ?? ''));
-				const relativeEnd = this.parseTimestamp(String(raw.end ?? ''));
-				const text = String(raw.text ?? '').trim();
-				return {
-					speakerId: String(raw.speakerId || 'SPEAKER_UNKNOWN'),
-					startSec: chunk.startSec + relativeStart,
-					endSec: chunk.startSec + relativeEnd,
-					text,
-				} as DiarizedTranscriptSegment;
-			})
-			.filter((segment: DiarizedTranscriptSegment) => segment.text && Number.isFinite(segment.startSec) && Number.isFinite(segment.endSec))
-			.map((segment: DiarizedTranscriptSegment) => segment.endSec > segment.startSec ? segment : { ...segment, endSec: segment.startSec + 1 });
-	}
+			);
+			if (!Array.isArray(parsed.segments)) return [];
+			return this.normalizeGeminiTranscriptSegments(parsed.segments, chunk.startSec);
+		}
 
 	private getSpeakerDiscoverySchema(Type: Record<string, string>): unknown {
 		return {
@@ -454,7 +593,41 @@ export class TranscriberService {
 		};
 	}
 
-	private parseJsonResponse(text: unknown, label: string): any {
+	private getShortDiarizedTranscriptSchema(Type: Record<string, string>): unknown {
+		return {
+			type: Type.OBJECT,
+			properties: {
+				speakers: {
+					type: Type.ARRAY,
+					items: {
+						type: Type.OBJECT,
+						properties: {
+							id: { type: Type.STRING },
+							voiceDescription: { type: Type.STRING },
+							candidateName: { type: Type.STRING },
+						},
+						required: ['id'],
+					},
+				},
+				segments: {
+					type: Type.ARRAY,
+					items: {
+						type: Type.OBJECT,
+						properties: {
+							speakerId: { type: Type.STRING },
+							start: { type: Type.STRING },
+							end: { type: Type.STRING },
+							text: { type: Type.STRING },
+						},
+						required: ['speakerId', 'start', 'end', 'text'],
+					},
+				},
+			},
+			required: ['speakers', 'segments'],
+		};
+	}
+
+	private parseJsonResponse(text: unknown, label: string, response?: GeminiGenerateContentResponse): any {
 		if (typeof text !== 'string' || !text.trim()) {
 			throw new Error(`${label} returned no text content.`);
 		}
@@ -464,8 +637,34 @@ export class TranscriberService {
 		try {
 			return JSON.parse(trimmed);
 		} catch (error) {
-			throw new Error(`${label} returned invalid JSON: ${(error as Error).message}`);
+			const diagnostics = this.formatGeminiJsonDiagnostics(response, trimmed);
+			throw new Error(
+				`${label} returned invalid JSON: ${(error as Error).message}${diagnostics ? ` (${diagnostics})` : ''}`,
+			);
 		}
+	}
+
+	private formatGeminiJsonDiagnostics(response: GeminiGenerateContentResponse | undefined, text: string): string {
+		const parts: string[] = [`responseLength=${text.length}`];
+		const firstCandidate = response?.candidates?.[0];
+		if (firstCandidate?.finishReason) {
+			parts.push(`finishReason=${firstCandidate.finishReason}`);
+		}
+		if (firstCandidate?.finishMessage) {
+			parts.push(`finishMessage=${firstCandidate.finishMessage}`);
+		}
+		const usage = response?.usageMetadata;
+		if (usage) {
+			const tokenParts = [
+				usage.promptTokenCount !== undefined ? `prompt=${usage.promptTokenCount}` : '',
+				usage.candidatesTokenCount !== undefined ? `candidates=${usage.candidatesTokenCount}` : '',
+				usage.totalTokenCount !== undefined ? `total=${usage.totalTokenCount}` : '',
+			].filter(Boolean);
+			if (tokenParts.length) {
+				parts.push(`tokens:${tokenParts.join(',')}`);
+			}
+		}
+		return parts.join('; ');
 	}
 
 	private normalizeDiscoveredSpeakers(value: unknown): DiscoveredSpeaker[] {
@@ -505,6 +704,46 @@ export class TranscriberService {
 			.sort((a, b) => a.startSec - b.startSec);
 	}
 
+	private normalizeGeminiTranscriptSegments(value: unknown, offsetSec: number): DiarizedTranscriptSegment[] {
+		if (!Array.isArray(value)) return [];
+		return value
+			.map((item: unknown) => {
+				const raw = item as { speakerId?: unknown; start?: unknown; end?: unknown; text?: unknown };
+				const relativeStart = this.parseTimestamp(String(raw.start ?? ''));
+				const relativeEnd = this.parseTimestamp(String(raw.end ?? ''));
+				const text = String(raw.text ?? '').trim();
+				return {
+					speakerId: this.normalizeSpeakerId(String(raw.speakerId || '')) || 'SPEAKER_UNKNOWN',
+					startSec: offsetSec + relativeStart,
+					endSec: offsetSec + relativeEnd,
+					text,
+				} as DiarizedTranscriptSegment;
+			})
+			.filter((segment: DiarizedTranscriptSegment) => segment.text && Number.isFinite(segment.startSec) && Number.isFinite(segment.endSec))
+			.map((segment: DiarizedTranscriptSegment) => segment.endSec > segment.startSec ? segment : { ...segment, endSec: segment.startSec + 1 })
+			.sort((a, b) => a.startSec - b.startSec);
+	}
+
+	private deriveSpeakersFromSegments(segments: DiarizedTranscriptSegment[]): DiscoveredSpeaker[] {
+		const seen = new Set<string>();
+		const speakers: DiscoveredSpeaker[] = [];
+		for (const segment of segments) {
+			if (!segment.speakerId || seen.has(segment.speakerId)) continue;
+			seen.add(segment.speakerId);
+			speakers.push({ id: segment.speakerId, voiceDescription: this.getSpeakerDisplayLabel(segment.speakerId), candidateName: null });
+		}
+		return speakers;
+	}
+
+	private buildTimelineFromTranscriptSegments(segments: DiarizedTranscriptSegment[]): SpeakerTimelineSegment[] {
+		return segments.map(segment => ({
+			speakerId: segment.speakerId,
+			startSec: segment.startSec,
+			endSec: segment.endSec,
+			confidence: 'high',
+		}));
+	}
+
 	private normalizeSpeakerId(value: string): string {
 		const upper = value.trim().toUpperCase().replace(/\s+/g, '_');
 		const direct = upper.match(/^SPEAKER_(\d+)$/);
@@ -535,6 +774,12 @@ export class TranscriberService {
 			return parts[0] * 3600 + parts[1] * 60 + parts[2];
 		}
 		return Number.NaN;
+	}
+
+	getSpeakerDisplayLabel(speakerId: string): string {
+		const match = this.normalizeSpeakerId(speakerId).match(/^SPEAKER_(\d+)$/);
+		if (!match) return speakerId;
+		return `Speaker ${Number(match[1]) + 1}`;
 	}
 
 	private formatHms(seconds: number): string {
@@ -683,6 +928,35 @@ export class TranscriberService {
 		);
 	}
 
+	private async withTiming<T>(
+		label: string,
+		details: Record<string, unknown>,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		const startedAt = this.nowMs();
+		console.info(`[AI Transcriber] ${label} start.`, details);
+		try {
+			const result = await operation();
+			console.info(`[AI Transcriber] ${label} complete.`, {
+				...details,
+				durationMs: Math.round(this.nowMs() - startedAt),
+			});
+			return result;
+		} catch (error) {
+			console.warn(`[AI Transcriber] ${label} failed.`, {
+				...details,
+				durationMs: Math.round(this.nowMs() - startedAt),
+			}, error);
+			throw error;
+		}
+	}
+
+	private nowMs(): number {
+		return typeof performance !== 'undefined' && typeof performance.now === 'function'
+			? performance.now()
+			: Date.now();
+	}
+
 	private async mapWithConcurrency<T, R>(
 		items: T[],
 		concurrency: number,
@@ -756,15 +1030,34 @@ export class TranscriberService {
 		};
 	}
 
-	private getOpenAIClient(apiKey: string): OpenAI {
-		const cached = this.openAIClients.get(apiKey);
+	private getOpenAIClient(apiKey: string, baseURL?: string): OpenAI {
+		const cacheKey = `${baseURL || 'openai'}:${apiKey}`;
+		const cached = this.openAIClients.get(cacheKey);
 		if (cached) return cached;
 		const client = new OpenAI({
 			apiKey,
+			...(baseURL ? { baseURL } : {}),
 			dangerouslyAllowBrowser: true,
 		});
-		this.openAIClients.set(apiKey, client);
+		this.openAIClients.set(cacheKey, client);
 		return client;
+	}
+
+	private async blobToBase64(blob: Blob, signal?: AbortSignal): Promise<string> {
+		this.throwIfAborted(signal);
+		const dataUrl = await new Promise<string>((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(String(reader.result || ''));
+			reader.onerror = () => reject(reader.error || new Error('Failed to read audio chunk'));
+			reader.readAsDataURL(blob);
+		});
+		this.throwIfAborted(signal);
+		const commaIndex = dataUrl.indexOf(',');
+		const base64 = commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : dataUrl;
+		if (!base64) {
+			throw new Error('Failed to encode audio chunk for OpenRouter');
+		}
+		return base64;
 	}
 
 	private getDecodeAudioContext(): AudioContext {
@@ -854,6 +1147,107 @@ export class TranscriberService {
 		const fullText = results.join('\n').trim();
 		this.emitProgress(options, { provider: 'openai', stage: 'done', totalChunks: chunks.length, completedChunks });
 		console.info('[AI Transcriber] OpenAI transcription complete.', { textLength: fullText.length });
+		return fullText;
+	}
+
+	private async transcribeWithOpenRouter(
+		blob: Blob,
+		settings: TranscriberSettings,
+		options: TranscribeOptions,
+	): Promise<string> {
+		const openrouter = this.getOpenAIClient(settings.apiKey, OPENROUTER_BASE_URL);
+
+		this.emitProgress(options, { provider: 'openrouter', stage: 'preprocess' });
+		const chunks = await this.preprocessForGemini(blob, 15 * 60, options);
+		console.info('[AI Transcriber] OpenRouter chunks ready.', {
+			chunks: chunks.length,
+			chunkBytes: chunks.map(chunk => chunk.size),
+		});
+
+		if (!chunks.length) {
+			return '';
+		}
+
+		let completedChunks = 0;
+		const results = await this.mapWithConcurrency(
+			chunks,
+			2,
+			options.signal,
+			async (chunk, index, workerSignal) => {
+				const chunkIndex = index + 1;
+				this.emitProgress(options, {
+					provider: 'openrouter',
+					stage: 'transcribe',
+					currentChunk: chunkIndex,
+					totalChunks: chunks.length,
+					completedChunks,
+				});
+
+				const transcription = await this.withRetries(
+					async () => {
+						this.throwIfAborted(workerSignal);
+						let prompt =
+							settings.prompt ||
+							'Please transcribe this audio file verbatim. Output only the transcript text in the original spoken language. Do not summarize or translate.';
+						if (options.context && options.context.trim()) {
+							prompt +=
+								'\n\n【用户提供的会议背景（仅用于提高识别准确性）】\n' +
+								options.context.trim() +
+								'\n【使用规则】\n- 仅用于人名/组织/术语识别\n- 不要添加音频中未出现的内容';
+						}
+
+						const audioBase64 = await this.blobToBase64(chunk, workerSignal);
+						const response = await openrouter.chat.completions.create(
+							{
+								model: settings.model,
+								messages: [
+									{
+										role: 'user',
+										content: [
+											{ type: 'text', text: prompt },
+											{
+												type: 'input_audio',
+												input_audio: {
+													data: audioBase64,
+													format: 'wav',
+												},
+											},
+										],
+									},
+								],
+								temperature: settings.temperature,
+								max_tokens: 65536,
+							},
+							{ signal: workerSignal },
+						);
+
+						const result = response.choices?.[0]?.message?.content;
+						if (typeof result !== 'string') {
+							throw new Error('Invalid response from OpenRouter API');
+						}
+						return result;
+					},
+					{
+						label: `OpenRouter chunk ${chunkIndex}/${chunks.length}`,
+						signal: workerSignal,
+					},
+				);
+
+				completedChunks++;
+				this.emitProgress(options, {
+					provider: 'openrouter',
+					stage: 'transcribe',
+					currentChunk: chunkIndex,
+					totalChunks: chunks.length,
+					completedChunks,
+				});
+				return transcription;
+			},
+		);
+
+		const fullText = results.join('\n').trim();
+		this.emitProgress(options, { provider: 'openrouter', stage: 'done', totalChunks: chunks.length, completedChunks });
+		console.info('[AI Transcriber] OpenRouter transcription complete.', { textLength: fullText.length });
 		return fullText;
 	}
 

@@ -1,35 +1,81 @@
-import { App, PluginSettingTab, Setting, Modal, TextComponent, TextAreaComponent, Notice } from 'obsidian';
+import { App, PluginSettingTab, Setting, Modal, TextComponent, TextAreaComponent, Notice, ButtonComponent } from 'obsidian';
 import ObsidianAITranscriber from '../../main';
-import { SystemPromptTemplate } from './types';
+import { ApiProvider, PluginSettings, SystemPromptTemplate } from './types';
 import { SidecarStatus } from '../services/sidecar';
 import { t } from '../i18n';
 
 export default class SettingsTab extends PluginSettingTab {
 	plugin: ObsidianAITranscriber;
-	private saveDebounceTimer: number | null = null;
-	private readonly SAVE_DEBOUNCE_MS = 500;
+	private draftSettings: PluginSettings | null = null;
+	private saveButton: ButtonComponent | null = null;
+	private hasUnsavedChanges = false;
+	private isSaving = false;
 
 	constructor(app: App, plugin: ObsidianAITranscriber) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
 
-	private scheduleSave(): void {
-		if (this.saveDebounceTimer !== null) {
-			window.clearTimeout(this.saveDebounceTimer);
-		}
-		this.saveDebounceTimer = window.setTimeout(() => {
-			this.saveDebounceTimer = null;
-			void this.plugin.saveSettings();
-		}, this.SAVE_DEBOUNCE_MS);
+	private cloneSettings(settings: PluginSettings): PluginSettings {
+		return JSON.parse(JSON.stringify(settings)) as PluginSettings;
 	}
 
-	private async flushPendingSave(): Promise<void> {
-		if (this.saveDebounceTimer !== null) {
-			window.clearTimeout(this.saveDebounceTimer);
-			this.saveDebounceTimer = null;
+	private get settings(): PluginSettings {
+		if (!this.draftSettings) {
+			this.draftSettings = this.cloneSettings(this.plugin.settings);
 		}
-		await this.plugin.saveSettings();
+		return this.draftSettings;
+	}
+
+	private markDirty(): void {
+		this.hasUnsavedChanges = true;
+		this.updateSaveButton();
+	}
+
+	private updateSaveButton(): void {
+		if (!this.saveButton) return;
+		this.saveButton.setButtonText(this.isSaving ? 'Saving...' : 'Save Settings');
+		this.saveButton.setDisabled(this.isSaving);
+		if (!this.isSaving) {
+			this.saveButton.setDisabled(!this.hasUnsavedChanges);
+		}
+	}
+
+	private async handleSaveClick(): Promise<void> {
+		if (!this.hasUnsavedChanges || this.isSaving || !this.draftSettings) return;
+
+		this.isSaving = true;
+		this.updateSaveButton();
+		try {
+			this.plugin.settings = this.cloneSettings(this.draftSettings);
+			await this.plugin.saveSettings();
+			await this.plugin.refreshDiarizationStatusBar();
+			this.draftSettings = this.cloneSettings(this.plugin.settings);
+			this.hasUnsavedChanges = false;
+			new Notice('Settings saved.');
+		} catch (error: unknown) {
+			console.error('[AI Transcriber] Failed to save settings:', error);
+			new Notice(`Failed to save settings: ${(error as Error).message}`);
+		} finally {
+			this.isSaving = false;
+			this.updateSaveButton();
+		}
+	}
+
+	private renderSaveButton(containerEl: HTMLElement): void {
+		new Setting(containerEl)
+			.setName('Settings')
+			.setDesc('Changes are written to disk only after you click Save Settings.')
+			.addButton(button => {
+				this.saveButton = button;
+				button
+					.setButtonText('Save Settings')
+					.setCta()
+					.onClick(() => {
+						void this.handleSaveClick();
+					});
+				this.updateSaveButton();
+			});
 	}
 
 	private formatDiarizationStatus(status: SidecarStatus): string {
@@ -43,7 +89,38 @@ export default class SettingsTab extends PluginSettingTab {
 		return t('diarizationStatusError', { message: status.error || status.message });
 	}
 
+	private getProviderDescription(): string {
+		return 'Choose OpenAI, Gemini, or OpenRouter';
+	}
+
+	private addProviderOptions(dropdown: { addOption: (value: string, display: string) => unknown }): void {
+		dropdown.addOption('openai', 'OpenAI');
+		dropdown.addOption('gemini', 'Gemini');
+		dropdown.addOption('openrouter', 'OpenRouter');
+	}
+
+	private getTranscriberModelPlaceholder(provider: ApiProvider): string {
+		if (provider === 'openrouter') {
+			return 'Example: google/gemini-3.5-flash';
+		}
+		if (provider === 'gemini') {
+			return 'Example: gemini-2.5-flash';
+		}
+		return 'Example: gpt-4o-transcribe';
+	}
+
+	private getEditorModelPlaceholder(provider: ApiProvider): string {
+		if (provider === 'openrouter') {
+			return 'Example: google/gemini-3.5-flash';
+		}
+		if (provider === 'gemini') {
+			return 'Example: gemini-2.5-flash';
+		}
+		return 'Example: gpt-4o';
+	}
+
 	private renderDiarizationSettings(containerEl: HTMLElement): void {
+		const settings = this.settings;
 		containerEl.createEl('h2', { text: t('diarizationSettingsTitle') });
 
 		new Setting(containerEl)
@@ -52,18 +129,17 @@ export default class SettingsTab extends PluginSettingTab {
 			.addDropdown(dropdown => dropdown
 				.addOption('gemini', 'Gemini cloud (recommended)')
 				.addOption('local-python', 'Local pyannote sidecar (experimental)')
-				.setValue(this.plugin.settings.diarization.mode)
-				.onChange(async value => {
-					this.plugin.settings.diarization.mode = value as 'gemini' | 'local-python';
-					await this.flushPendingSave();
-					await this.plugin.refreshDiarizationStatusBar();
+				.setValue(settings.diarization.mode)
+				.onChange(value => {
+					settings.diarization.mode = value as 'gemini' | 'local-python';
+					this.markDirty();
 					this.display();
 				}));
 
-		if (this.plugin.settings.diarization.mode === 'gemini') {
+		if (settings.diarization.mode === 'gemini') {
 			new Setting(containerEl)
 				.setName(t('diarizationStatusName'))
-				.setDesc('Configured: Gemini two-phase speaker timeline is used when Gemini is selected and participants are chosen before transcription.');
+				.setDesc('Configured: Gemini two-phase speaker timeline is used when Gemini is selected. Participants and meeting context are optional hints.');
 			return;
 		}
 
@@ -73,7 +149,7 @@ export default class SettingsTab extends PluginSettingTab {
 		let authToken = '';
 
 		const refreshStatus = async () => {
-			const status = await this.plugin.refreshDiarizationStatusBar();
+			const status = await this.plugin.sidecarService.getStatus();
 			statusSetting.setDesc(this.formatDiarizationStatus(status));
 			if (status.config?.authToken && !authToken) {
 				authToken = status.config.authToken;
@@ -180,10 +256,11 @@ export default class SettingsTab extends PluginSettingTab {
 	}
 
 	private exportTemplates(): void {
+		const settings = this.settings;
 		const payload = {
 			version: 1,
-			activeTemplateName: this.plugin.settings.editor.activeSystemPromptTemplateName,
-			templates: this.plugin.settings.editor.systemPromptTemplates,
+			activeTemplateName: settings.editor.activeSystemPromptTemplateName,
+			templates: settings.editor.systemPromptTemplates,
 		};
 		const json = JSON.stringify(payload, null, 2);
 		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -251,9 +328,8 @@ export default class SettingsTab extends PluginSettingTab {
 			return;
 		}
 
-		const existingNames = new Set(
-			this.plugin.settings.editor.systemPromptTemplates.map(template => template.name),
-		);
+		const settings = this.settings;
+		const existingNames = new Set(settings.editor.systemPromptTemplates.map(template => template.name));
 
 		const imported: SystemPromptTemplate[] = [];
 		for (const item of importData.templates) {
@@ -274,100 +350,103 @@ export default class SettingsTab extends PluginSettingTab {
 			return;
 		}
 
-		this.plugin.settings.editor.systemPromptTemplates.push(...imported);
+		settings.editor.systemPromptTemplates.push(...imported);
 		if (
 			typeof importData.activeTemplateName === 'string' &&
 			imported.some(template => template.name === importData.activeTemplateName)
 		) {
-			this.plugin.settings.editor.activeSystemPromptTemplateName = importData.activeTemplateName;
-		} else if (!this.plugin.settings.editor.activeSystemPromptTemplateName) {
-			this.plugin.settings.editor.activeSystemPromptTemplateName = imported[0].name;
+			settings.editor.activeSystemPromptTemplateName = importData.activeTemplateName;
+		} else if (!settings.editor.activeSystemPromptTemplateName) {
+			settings.editor.activeSystemPromptTemplateName = imported[0].name;
 		}
 
-		await this.flushPendingSave();
+		this.markDirty();
 		new Notice(t('noticeTemplateImportSuccess', { count: imported.length }));
 		this.display();
 	}
 
 	hide(): void {
-		void this.flushPendingSave().catch(error => {
-			console.error('[AI Transcriber] Failed to flush settings on close:', error);
-		});
+		this.draftSettings = null;
+		this.hasUnsavedChanges = false;
+		this.saveButton = null;
 		super.hide();
 	}
 
 	private getActiveTemplate(): SystemPromptTemplate | undefined {
-		const activeName = this.plugin.settings.editor.activeSystemPromptTemplateName;
-		if (!this.plugin.settings.editor.systemPromptTemplates) {
-			this.plugin.settings.editor.systemPromptTemplates = []; // Initialize if undefined
+		const settings = this.settings;
+		const activeName = settings.editor.activeSystemPromptTemplateName;
+		if (!settings.editor.systemPromptTemplates) {
+			settings.editor.systemPromptTemplates = []; // Initialize if undefined
 		}
 
 		// Only create Default template if the array is completely empty (new user)
-		if (this.plugin.settings.editor.systemPromptTemplates.length === 0) {
-			this.plugin.settings.editor.systemPromptTemplates.push({
+		if (settings.editor.systemPromptTemplates.length === 0) {
+			settings.editor.systemPromptTemplates.push({
 				name: 'Default',
 				prompt: "You are a professional meeting-minutes generation assistant. Upon receiving the user's raw transcript, output a structured Markdown document **strictly** according to the following requirements—and ensure that the language you use matches the language of the raw transcript.\n\n1. **Format**\n\n   - Divide into three sections with level-2 headings:\n```\n## 📝 Summary\n## ✨ Key Points\n## 📄 Transcript\n```\n   - In **Summary**, use 200–300 words to distill the core conclusions.\n   - In **Key Points**, list 5–10 concise bullet points (Markdown list).\n   - In **Transcript**\n\t   1. Remove all filler (\"um,\" \"uh\"), stammers, repetitions, and meaningless padding.\n\t   2. Break into paragraphs **at every speaker change** or **every 4–5 sentences** (no paragraph longer than ~200 words).\n\t   3. Use a blank line to separate each paragraph.\n\n2. **Content Requirements**\n\n   - Do **not** add any new information or commentary—only refine and reorganize what's in the original.\n   - Preserve full semantic integrity; do **not** alter facts.\n\n3. **Output Requirements**\n\n   - **Start** directly with `## 📝 Summary` and output **only** the structured Markdown—no leading prompts, explanations, acknowledgments, or dialogue.\n\n4. **Example Structure**\n```markdown\n## 📝 Summary\n(200–300 words)\n\n## ✨ Key Points\n- Point 1\n- Point 2\n…\n\n## 📄 Transcript\nParagraph 1\n\nParagraph 2\n\n…\n```"
 			});
-			this.plugin.settings.editor.activeSystemPromptTemplateName = 'Default';
+			settings.editor.activeSystemPromptTemplateName = 'Default';
 		}
 
-		let template = this.plugin.settings.editor.systemPromptTemplates.find(t => t.name === activeName);
-		if (!template && this.plugin.settings.editor.systemPromptTemplates.length > 0) {
+		let template = settings.editor.systemPromptTemplates.find(t => t.name === activeName);
+		if (!template && settings.editor.systemPromptTemplates.length > 0) {
 			// If active template not found, default to the first one in the array
-			this.plugin.settings.editor.activeSystemPromptTemplateName = this.plugin.settings.editor.systemPromptTemplates[0].name;
-			template = this.plugin.settings.editor.systemPromptTemplates[0];
+			settings.editor.activeSystemPromptTemplateName = settings.editor.systemPromptTemplates[0].name;
+			template = settings.editor.systemPromptTemplates[0];
 		}
 		return template;
 	}
 
 	display(): void {
+		const settings = this.settings;
 		const { containerEl } = this;
 		containerEl.empty();
 		containerEl.addClass('ai-transcriber-settings');
+		this.saveButton = null;
 
 		// Ensure systemPromptTemplates and activeSystemPromptTemplateName are initialized
-		if (!this.plugin.settings.editor.systemPromptTemplates) {
-			this.plugin.settings.editor.systemPromptTemplates = [];
+		if (!settings.editor.systemPromptTemplates) {
+			settings.editor.systemPromptTemplates = [];
 		}
 		// Initialize templates and set active template if needed
 		this.getActiveTemplate();
+		this.renderSaveButton(containerEl);
 
 		// Transcriber Settings
 		containerEl.createEl('h2', { text: '🎙️ Transcriber Settings' });
 		new Setting(containerEl)
 			.setName('API Provider')
-			.setDesc('Choose OpenAI or Gemini')
-			.addDropdown(drop => drop
-				.addOption('openai', 'OpenAI')
-				.addOption('gemini', 'Gemini')
-				.setValue(this.plugin.settings.transcriber.provider)
-				.onChange(async (value) => {
-					this.plugin.settings.transcriber.provider = value as 'openai' | 'gemini';
-					await this.flushPendingSave();
+			.setDesc(this.getProviderDescription())
+			.addDropdown(drop => {
+				this.addProviderOptions(drop);
+				drop.setValue(settings.transcriber.provider)
+				.onChange((value) => {
+					settings.transcriber.provider = value as ApiProvider;
+					this.markDirty();
 					this.display(); // Refresh to show conditional fields if any
-				})
-			);
+				});
+			});
 		new Setting(containerEl)
 			.setName('API Key')
 			.setDesc('Transcriber API Key')
 			.addText(text => {
 				text.inputEl.type = 'password';
 					text.setPlaceholder('Your API Key')
-						.setValue(this.plugin.settings.transcriber.apiKey)
+						.setValue(settings.transcriber.apiKey)
 						.onChange((value) => {
-							this.plugin.settings.transcriber.apiKey = value;
-							this.scheduleSave();
+							settings.transcriber.apiKey = value;
+							this.markDirty();
 						});
 				});
 		new Setting(containerEl)
 			.setName('Model Name')
 			.setDesc('Specify the model to use for transcription.')
 			.addText(text => text
-				.setPlaceholder('Example: gpt-4o-transcribe')
-				.setValue(this.plugin.settings.transcriber.model)
+				.setPlaceholder(this.getTranscriberModelPlaceholder(settings.transcriber.provider))
+				.setValue(settings.transcriber.model)
 				.onChange((value) => {
-					this.plugin.settings.transcriber.model = value;
-					this.scheduleSave();
+					settings.transcriber.model = value;
+					this.markDirty();
 				})
 			);
 		new Setting(containerEl)
@@ -375,10 +454,10 @@ export default class SettingsTab extends PluginSettingTab {
 			.setDesc('Optional: Add words with their correct spellings to help with transcription.')
 			.addTextArea(textArea => textArea
 				.setPlaceholder('Clarify uncommon words or phrases in the transcript.')
-				.setValue(this.plugin.settings.transcriber.prompt)
+				.setValue(settings.transcriber.prompt)
 				.onChange((value) => {
-					this.plugin.settings.transcriber.prompt = value;
-					this.scheduleSave();
+					settings.transcriber.prompt = value;
+					this.markDirty();
 				})
 			);
 		new Setting(containerEl)
@@ -386,12 +465,12 @@ export default class SettingsTab extends PluginSettingTab {
 			.setDesc('Enter a value between 0.0 and 1.0. Suggested value: 0.2.')
 			.addText(text => text
 				.setPlaceholder('0.0-1.0')
-				.setValue(this.plugin.settings.transcriber.temperature.toString())
+				.setValue(settings.transcriber.temperature.toString())
 				.onChange((value) => {
 					const num = parseFloat(value);
 					if (!isNaN(num) && num >= 0 && num <= 1) {
-						this.plugin.settings.transcriber.temperature = num;
-						this.scheduleSave();
+						settings.transcriber.temperature = num;
+						this.markDirty();
 					}
 				})
 			);
@@ -400,10 +479,10 @@ export default class SettingsTab extends PluginSettingTab {
 			.setDesc('Where to save recordings (relative to vault root)')
 			.addText(text => text
 				.setPlaceholder('Recordings/')
-				.setValue(this.plugin.settings.transcriber.audioDir)
+				.setValue(settings.transcriber.audioDir)
 				.onChange((value) => {
-					this.plugin.settings.transcriber.audioDir = value;
-					this.scheduleSave();
+					settings.transcriber.audioDir = value;
+					this.markDirty();
 				})
 			);
 		new Setting(containerEl)
@@ -411,23 +490,23 @@ export default class SettingsTab extends PluginSettingTab {
 			.setDesc('Where to save transcripts (relative to vault root)')
 			.addText(text => text
 				.setPlaceholder('Transcripts/')
-				.setValue(this.plugin.settings.transcriber.transcriptDir)
+				.setValue(settings.transcriber.transcriptDir)
 				.onChange((value) => {
-					this.plugin.settings.transcriber.transcriptDir = value;
-					this.scheduleSave();
+					settings.transcriber.transcriptDir = value;
+					this.markDirty();
 				})
 			);
 
 		// Gemini upload mode (quality vs speed)
-		if (this.plugin.settings.transcriber.provider === 'gemini') {
+		if (settings.transcriber.provider === 'gemini') {
 			new Setting(containerEl)
 				.setName('Gemini Upload Mode')
 				.setDesc('When enabled, audio is always converted to WAV before uploading for best transcription quality. Disable to upload original compressed audio for faster uploads.')
 					.addToggle(toggle => toggle
-						.setValue(this.plugin.settings.transcriber.preferQualityWav)
-						.onChange(async (value) => {
-							this.plugin.settings.transcriber.preferQualityWav = value;
-							await this.flushPendingSave();
+						.setValue(settings.transcriber.preferQualityWav)
+						.onChange((value) => {
+							settings.transcriber.preferQualityWav = value;
+							this.markDirty();
 						})
 					);
 		}
@@ -440,55 +519,54 @@ export default class SettingsTab extends PluginSettingTab {
 			.setName('Enable Editor')
 			.setDesc('Toggle to enable Editor API enhancements')
 			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.editor.enabled)
-				.onChange(async (value) => {
-					this.plugin.settings.editor.enabled = value;
-					await this.flushPendingSave();
+				.setValue(settings.editor.enabled)
+				.onChange((value) => {
+					settings.editor.enabled = value;
+					this.markDirty();
 					this.display(); // Refresh to show/hide editor settings
 				})
 			);
 
-		if (this.plugin.settings.editor.enabled) {
+		if (settings.editor.enabled) {
 			new Setting(containerEl)
 				.setName('API Provider')
-				.setDesc('Choose OpenAI or Gemini')
-				.addDropdown(drop => drop
-					.addOption('openai', 'OpenAI')
-					.addOption('gemini', 'Gemini')
-					.setValue(this.plugin.settings.editor.provider)
-					.onChange(async (value) => {
-						this.plugin.settings.editor.provider = value as 'openai' | 'gemini';
-						await this.flushPendingSave();
+				.setDesc(this.getProviderDescription())
+				.addDropdown(drop => {
+					this.addProviderOptions(drop);
+					drop.setValue(settings.editor.provider)
+					.onChange((value) => {
+						settings.editor.provider = value as ApiProvider;
+						this.markDirty();
 						this.display(); // Refresh
-					})
-				);
+					});
+				});
 			new Setting(containerEl)
 				.setName('API Key')
 				.setDesc('Editor API Key')
 				.addText(text => {
 					text.inputEl.type = 'password';
 						text.setPlaceholder('Your API Key.')
-							.setValue(this.plugin.settings.editor.apiKey)
+							.setValue(settings.editor.apiKey)
 							.onChange((value) => {
-								this.plugin.settings.editor.apiKey = value;
-								this.scheduleSave();
+								settings.editor.apiKey = value;
+								this.markDirty();
 							});
 					});
 			new Setting(containerEl)
 				.setName('Model Name')
 				.setDesc('Specify the model to use for editing.')
 				.addText(text => text
-					.setPlaceholder('Example: gemini-2.5-flash-preview-04-17')
-					.setValue(this.plugin.settings.editor.model)
+					.setPlaceholder(this.getEditorModelPlaceholder(settings.editor.provider))
+					.setValue(settings.editor.model)
 					.onChange((value) => {
-						this.plugin.settings.editor.model = value;
-						this.scheduleSave();
+						settings.editor.model = value;
+						this.markDirty();
 					})
 				);
 
 
-			const templates = this.plugin.settings.editor.systemPromptTemplates;
-			const activeTemplateName = this.plugin.settings.editor.activeSystemPromptTemplateName;
+			const templates = settings.editor.systemPromptTemplates;
+			const activeTemplateName = settings.editor.activeSystemPromptTemplateName;
 
 			// Dropdown for selecting active template
 			new Setting(containerEl)
@@ -499,9 +577,9 @@ export default class SettingsTab extends PluginSettingTab {
 						dropdown.addOption(template.name, template.name);
 					});
 					dropdown.setValue(activeTemplateName)
-						.onChange(async (value) => {
-							this.plugin.settings.editor.activeSystemPromptTemplateName = value;
-							await this.flushPendingSave();
+						.onChange((value) => {
+							settings.editor.activeSystemPromptTemplateName = value;
+							this.markDirty();
 							this.display(); // Re-render to update template name and prompt fields
 						});
 				});
@@ -529,8 +607,8 @@ export default class SettingsTab extends PluginSettingTab {
 									return;
 								}
 								currentActiveTemplate.name = newName;
-								this.plugin.settings.editor.activeSystemPromptTemplateName = newName;
-								await this.flushPendingSave();
+								settings.editor.activeSystemPromptTemplateName = newName;
+								this.markDirty();
 								this.display(); // Re-render to update dropdown and other fields
 							} else if (newName === currentActiveTemplate.name) {
 								// If the name is the same (e.g., user clicked in and out), no need to do anything
@@ -558,7 +636,7 @@ export default class SettingsTab extends PluginSettingTab {
 							.setValue(currentActiveTemplate.prompt)
 							.onChange((value) => {
 								currentActiveTemplate.prompt = value;
-								this.scheduleSave();
+								this.markDirty();
 							});
 						textArea.inputEl.rows = 10;
 						textArea.inputEl.style.width = '100%';
@@ -584,10 +662,10 @@ export default class SettingsTab extends PluginSettingTab {
 									.addButton(btn => btn
 										.setButtonText('Delete')
 										.setWarning()
-										.onClick(async () => {
-											this.plugin.settings.editor.systemPromptTemplates = templates.filter(t => t.name !== currentActiveTemplate.name);
-											this.plugin.settings.editor.activeSystemPromptTemplateName = 'Default'; // Fallback to Default
-											await this.flushPendingSave();
+										.onClick(() => {
+											settings.editor.systemPromptTemplates = templates.filter(t => t.name !== currentActiveTemplate.name);
+											settings.editor.activeSystemPromptTemplateName = 'Default'; // Fallback to Default
+											this.markDirty();
 											confirmModal.close();
 											this.display(); // Re-render
 										}));
@@ -603,13 +681,14 @@ export default class SettingsTab extends PluginSettingTab {
 				.setDesc('Add a new template for system prompts.')
 				.addButton(button => button
 					.setButtonText('Create New Template')
-					.onClick(async () => {
-						new NewTemplateModal(this.app, this.plugin, (result) => {
+					.onClick(() => {
+						new NewTemplateModal(this.app, this.plugin, templates, (result) => {
 							if (result) {
 								const newTemplate: SystemPromptTemplate = { name: result.name, prompt: result.prompt };
-								this.plugin.settings.editor.systemPromptTemplates.push(newTemplate);
-								this.plugin.settings.editor.activeSystemPromptTemplateName = newTemplate.name;
-								this.flushPendingSave().then(() => this.display());
+								settings.editor.systemPromptTemplates.push(newTemplate);
+								settings.editor.activeSystemPromptTemplateName = newTemplate.name;
+								this.markDirty();
+								this.display();
 							}
 						}).open();
 					})
@@ -635,10 +714,10 @@ export default class SettingsTab extends PluginSettingTab {
 				.addTextArea(textArea => {
 						textArea
 							.setPlaceholder('')
-							.setValue(this.plugin.settings.editor.userPrompt)
+							.setValue(settings.editor.userPrompt)
 							.onChange((value) => {
-								this.plugin.settings.editor.userPrompt = value;
-								this.scheduleSave();
+								settings.editor.userPrompt = value;
+								this.markDirty();
 							});
 					textArea.inputEl.rows = 3;
 					textArea.inputEl.style.width = '100%';
@@ -648,12 +727,12 @@ export default class SettingsTab extends PluginSettingTab {
 				.setDesc('Enter a value between 0.0 and 1.0. Suggested value: 0.3.')
 				.addText(text => text
 					.setPlaceholder('0.0-1.0')
-					.setValue(this.plugin.settings.editor.temperature.toString())
+					.setValue(settings.editor.temperature.toString())
 					.onChange((value) => {
 						const num = parseFloat(value);
 						if (!isNaN(num) && num >= 0 && num <= 1) {
-							this.plugin.settings.editor.temperature = num;
-							this.scheduleSave();
+							settings.editor.temperature = num;
+							this.markDirty();
 						}
 					})
 				);
@@ -661,10 +740,10 @@ export default class SettingsTab extends PluginSettingTab {
 				.setName('Keep Original Transcript')
 				.setDesc('Whether to keep original transcript when editing')
 				.addToggle(toggle => toggle
-					.setValue(this.plugin.settings.editor.keepOriginal)
-					.onChange(async (value) => {
-						this.plugin.settings.editor.keepOriginal = value;
-						await this.flushPendingSave();
+					.setValue(settings.editor.keepOriginal)
+					.onChange((value) => {
+						settings.editor.keepOriginal = value;
+						this.markDirty();
 					})
 				);
 		}
@@ -673,13 +752,20 @@ export default class SettingsTab extends PluginSettingTab {
 
 class NewTemplateModal extends Modal {
 	plugin: ObsidianAITranscriber;
+	existingTemplates: SystemPromptTemplate[];
 	onSubmit: (result: { name: string, prompt: string } | null) => void;
 	nameInput: TextComponent;
 	promptInput: TextAreaComponent;
 
-	constructor(app: App, plugin: ObsidianAITranscriber, onSubmit: (result: { name: string, prompt: string } | null) => void) {
+	constructor(
+		app: App,
+		plugin: ObsidianAITranscriber,
+		existingTemplates: SystemPromptTemplate[],
+		onSubmit: (result: { name: string, prompt: string } | null) => void
+	) {
 		super(app);
 		this.plugin = plugin;
+		this.existingTemplates = existingTemplates;
 		this.onSubmit = onSubmit;
 	}
 
@@ -691,7 +777,7 @@ class NewTemplateModal extends Modal {
 
 		let newName = 'New Template';
 		let i = 1;
-		while (this.plugin.settings.editor.systemPromptTemplates.some(t => t.name === newName)) {
+		while (this.existingTemplates.some(t => t.name === newName)) {
 			newName = `New Template ${++i}`;
 		}
 		
@@ -732,7 +818,7 @@ class NewTemplateModal extends Modal {
 						new Notice('模板名称不能为空');
 						return;
 					}
-					if (this.plugin.settings.editor.systemPromptTemplates.some(t => t.name === name)) {
+					if (this.existingTemplates.some(t => t.name === name)) {
 						new Notice(`模板名称 "${name}" 已存在，请使用其他名称`);
 						return;
 					}

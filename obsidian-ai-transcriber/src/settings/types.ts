@@ -1,5 +1,7 @@
+export type ApiProvider = 'openai' | 'gemini' | 'openrouter';
+
 export interface TranscriberSettings {
-	provider: 'openai' | 'gemini';
+	provider: ApiProvider;
 	apiKey: string;
 	model: string;
 	prompt: string;
@@ -27,7 +29,7 @@ export interface Participant {
 
 export interface EditorSettings {
 	enabled: boolean;
-	provider: 'openai' | 'gemini';
+	provider: ApiProvider;
 	apiKey: string;
 	model: string;
 	participants: Participant[];

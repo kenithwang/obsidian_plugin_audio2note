@@ -147,19 +147,21 @@ export default class RecordModal extends Modal {
 							return;
 						}
 
-						await this.plugin.processAudioBlob(result.blob, baseName, {
-							systemPromptOverride: selectedTemplate.prompt,
-							context,
-							participants,
-							saveRawWhenEditorEnabled: this.plugin.settings.editor.keepOriginal,
-							openResult: true,
-						});
+							await this.plugin.processAudioBlob(result.blob, baseName, {
+								systemPromptOverride: selectedTemplate.prompt,
+								context,
+								participants,
+								durationSec: result.duration,
+								saveRawWhenEditorEnabled: this.plugin.settings.editor.keepOriginal,
+								openResult: true,
+							});
 						this.close();
 					}).open();
 				} else {
-					await this.plugin.processAudioBlob(result.blob, baseName, {
-						openResult: true,
-					});
+						await this.plugin.processAudioBlob(result.blob, baseName, {
+							durationSec: result.duration,
+							openResult: true,
+						});
 					this.close();
 				}
 			} catch (error: unknown) { // Outer catch for errors during recorder.stop() or fileService.saveRecording()

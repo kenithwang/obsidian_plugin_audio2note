@@ -1,6 +1,8 @@
 import OpenAI from 'openai';
 import { EditorSettings } from '../settings/types';
 
+const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+
 // Cache dynamically imported Gemini module
 let genaiModule: typeof import('@google/genai') | null = null;
 async function getGenAIModule() {
@@ -62,15 +64,24 @@ ${context.trim()}
 `;
 	}
 
-	private getOpenAIClient(apiKey: string): OpenAI {
-		const cached = this.openAIClients.get(apiKey);
+	private getOpenAIClient(apiKey: string, baseURL?: string): OpenAI {
+		const cacheKey = `${baseURL || 'openai'}:${apiKey}`;
+		const cached = this.openAIClients.get(cacheKey);
 		if (cached) return cached;
 		const client = new OpenAI({
 			apiKey,
+			...(baseURL ? { baseURL } : {}),
 			dangerouslyAllowBrowser: true,
 		});
-		this.openAIClients.set(apiKey, client);
+		this.openAIClients.set(cacheKey, client);
 		return client;
+	}
+
+	private getOpenAICompatibleClient(settings: EditorSettings): OpenAI {
+		return this.getOpenAIClient(
+			settings.apiKey,
+			settings.provider === 'openrouter' ? OPENROUTER_BASE_URL : undefined,
+		);
 	}
 
 	private throwIfAborted(signal?: AbortSignal): void {
@@ -299,8 +310,8 @@ ${context.trim()}
 	): Promise<string> {
 		this.throwIfAborted(signal);
 
-		if (settings.provider === 'openai') {
-			const client = this.getOpenAIClient(settings.apiKey);
+		if (settings.provider === 'openai' || settings.provider === 'openrouter') {
+			const client = this.getOpenAICompatibleClient(settings);
 			const stream = await client.chat.completions.create(
 				{
 					model: settings.model,
@@ -391,8 +402,8 @@ ${context.trim()}
 		for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
 			this.throwIfAborted(signal);
 			try {
-				if (settings.provider === 'openai') {
-					const client = this.getOpenAIClient(settings.apiKey);
+				if (settings.provider === 'openai' || settings.provider === 'openrouter') {
+					const client = this.getOpenAICompatibleClient(settings);
 					const response = await client.chat.completions.create(
 						{
 							model: settings.model,

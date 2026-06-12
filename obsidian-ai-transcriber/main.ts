@@ -35,6 +35,7 @@ interface ProcessAudioBlobOptions {
 	systemPromptOverride?: string;
 	context?: string;
 	participants?: Participant[];
+	durationSec?: number;
 	saveRawWhenEditorEnabled?: boolean;
 	openResult?: boolean;
 }
@@ -74,6 +75,11 @@ export default class ObsidianAITranscriber extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+		console.info('[AI Transcriber] Plugin loaded.', {
+			version: this.manifest.version,
+			provider: this.settings.transcriber.provider,
+			diarizationMode: this.settings.diarization.mode,
+		});
 		this.recorder = new RecorderService();
 		this.transcriber = new TranscriberService();
 		this.fileService = new FileService(this.app);
@@ -531,6 +537,11 @@ export default class ObsidianAITranscriber extends Plugin {
 			return transcript;
 		}
 
+		if (!participants.length) {
+			await this.fileService.updateText(rawPath, session.text);
+			return session.text;
+		}
+
 		await this.fileService.updateText(rawPath, session.text);
 		await this.fileService.openFile(rawPath);
 
@@ -621,29 +632,31 @@ export default class ObsidianAITranscriber extends Plugin {
 
 	private buildGeminiDiarizedTranscript(result: GeminiDiarizedTranscript): string {
 		const speakerLines = result.speakers.length
-			? [
-				'### Speakers',
-				'',
-				...result.speakers.map(speaker => {
-					const description = speaker.voiceDescription ? ` - ${speaker.voiceDescription}` : '';
-					const candidate = speaker.candidateName ? ` (candidate: ${speaker.candidateName})` : '';
-					return `- ${speaker.id}${candidate}${description}`;
-				}),
-				'',
-			]
+				? [
+					'### Speakers',
+					'',
+					...result.speakers.map(speaker => {
+						const description = speaker.voiceDescription ? ` - ${speaker.voiceDescription}` : '';
+						const candidate = speaker.candidateName ? ` (candidate: ${speaker.candidateName})` : '';
+						const label = this.transcriber.getSpeakerDisplayLabel(speaker.id);
+						return `- ${label}${candidate}${description}`;
+					}),
+					'',
+				]
 			: [];
 		const timelineLines = result.timeline.length
 			? [
 				'### Speaker Timeline',
 				'',
-				...result.timeline.map(segment => {
-					const start = formatTimestamp(segment.startSec);
-					const end = formatTimestamp(segment.endSec);
-					const confidence = segment.confidence && segment.confidence !== 'high' ? ` confidence:${segment.confidence}` : '';
-					return `[${start} - ${end}] <!-- speaker:${segment.speakerId}${confidence} --> ${segment.speakerId}:`;
-				}),
-				'',
-			]
+					...result.timeline.map(segment => {
+						const start = formatTimestamp(segment.startSec);
+						const end = formatTimestamp(segment.endSec);
+						const confidence = segment.confidence && segment.confidence !== 'high' ? ` confidence:${segment.confidence}` : '';
+						const label = this.transcriber.getSpeakerDisplayLabel(segment.speakerId);
+						return `[${start} - ${end}] <!-- speaker:${segment.speakerId}${confidence} --> ${label}:`;
+					}),
+					'',
+				]
 			: [];
 		const transcriptLines = [
 			'### Transcript',
@@ -657,13 +670,13 @@ export default class ObsidianAITranscriber extends Plugin {
 		const start = formatTimestamp(segment.startSec);
 		const end = formatTimestamp(segment.endSec);
 		const confidence = segment.confidence && segment.confidence !== 'high' ? ` confidence:${segment.confidence}` : '';
-		return `[${start} - ${end}] <!-- speaker:${segment.speakerId}${confidence} --> ${segment.speakerId}: ${segment.text}`;
+		const label = this.transcriber.getSpeakerDisplayLabel(segment.speakerId);
+		return `[${start} - ${end}] <!-- speaker:${segment.speakerId}${confidence} --> ${label}: ${segment.text}`;
 	}
 
-	private shouldUseGeminiDiarization(participants: Participant[]): boolean {
+	private shouldUseGeminiDiarization(): boolean {
 		return this.settings.transcriber.provider === 'gemini'
-			&& this.settings.diarization.mode === 'gemini'
-			&& participants.length > 0;
+			&& this.settings.diarization.mode === 'gemini';
 	}
 
 	public async processAudioBlob(
@@ -683,9 +696,23 @@ export default class ObsidianAITranscriber extends Plugin {
 			systemPromptOverride,
 			context,
 			participants = [],
+			durationSec,
 			saveRawWhenEditorEnabled = true,
 			openResult = true,
 		} = options || {};
+
+		console.info('[AI Transcriber] Processing audio blob.', {
+			baseName,
+			mimeType: blob.type || 'unknown',
+			sizeBytes: blob.size,
+			provider: this.settings.transcriber.provider,
+			diarizationMode: this.settings.diarization.mode,
+			hasContext: Boolean(context?.trim()),
+			participantCount: participants.length,
+			durationSec,
+			editorEnabled: this.settings.editor.enabled,
+			hasSystemPromptOverride: systemPromptOverride !== undefined,
+		});
 
 		let rawPath: string | undefined;
 		let editedPath: string | undefined;
@@ -693,13 +720,14 @@ export default class ObsidianAITranscriber extends Plugin {
 		try {
 			let speakerAnalyses: SpeakerAnalysis[] = [];
 			let transcript: string;
-			if (this.shouldUseGeminiDiarization(participants)) {
+			if (this.shouldUseGeminiDiarization()) {
 				this.updateStatus(t('statusDiarizing'));
 				this.updateProgressNotice(t('statusDiarizing'));
-				const diarized = await this.transcriber.transcribeWithGeminiDiarization(blob, this.settings.transcriber, {
-					context,
-					signal,
-					onProgress: progress => {
+					const diarized = await this.transcriber.transcribeWithGeminiDiarization(blob, this.settings.transcriber, {
+						context,
+						durationSec,
+						signal,
+						onProgress: progress => {
 						const message = this.getTranscriptionProgressText(progress);
 						this.updateStatus(message);
 						this.updateProgressNotice(message);

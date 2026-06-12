@@ -1,13 +1,13 @@
 # Obsidian AI Transcriber
 
-An Obsidian plugin that records and transcribes audio into structured Markdown notes, powered by OpenAI and Google Gemini.
+An Obsidian plugin that records and transcribes audio into structured Markdown notes, powered by OpenAI, Google Gemini, and OpenRouter.
 
 ## Features
 
 ### Core
 
 - **Audio Recording** — Record directly within Obsidian via ribbon icon or command palette, with real-time waveform visualization.
-- **AI Transcription** — Transcribe audio to text using OpenAI (Whisper) or Google Gemini. Supports `.webm`, `.m4a`, `.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`, `.opus`, `.mp4`.
+- **AI Transcription** — Transcribe audio to text using OpenAI, Google Gemini, or OpenRouter audio-capable models. Supports `.webm`, `.m4a`, `.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`, `.opus`, `.mp4`.
 - **AI Editing** — Optionally refine raw transcripts into structured notes (e.g., meeting minutes) using customizable system prompt templates.
 - **Context Menu** — Right-click any supported audio file in the file explorer to transcribe it directly.
 
@@ -69,7 +69,7 @@ Open **Settings → Obsidian AI Transcriber**:
 
 | Section | Options |
 |---------|---------|
-| **Transcriber** | Provider (OpenAI / Gemini), API key, model, prompt, temperature, audio & transcript directories |
+| **Transcriber** | Provider (OpenAI / Gemini / OpenRouter), API key, model, prompt, temperature, audio & transcript directories |
 | **Editor** | Enable/disable, provider, API key, model, system prompt templates, user prompt, temperature, keep original toggle |
 | **Participants** | Manage participant list (name, org, intro) for meeting context |
 | **Templates** | Create, edit, delete, import/export system prompt templates |
@@ -90,7 +90,8 @@ Audio Input
          ▼
 ┌─────────────────────────┐
 │   TranscriberService    │
-│  OpenAI Whisper / Gemini│
+│ OpenAI / Gemini /       │
+│ OpenRouter transcription│
 │  parallel chunk upload  │
 └────────┬────────────────┘
          │
@@ -135,7 +136,7 @@ obsidian-ai-transcriber/
 ├── src/
 │   ├── i18n.ts              # Internationalization (en/zh)
 │   ├── services/
-│   │   ├── transcriber.ts   # Audio transcription (OpenAI/Gemini)
+│   │   ├── transcriber.ts   # Audio transcription (OpenAI/Gemini/OpenRouter)
 │   │   ├── editor.ts        # Two-stage AI editing with streaming
 │   │   ├── recorder.ts      # MediaRecorder with visualization
 │   │   └── file.ts          # File I/O and directory management
@@ -154,7 +155,9 @@ obsidian-ai-transcriber/
 ## Requirements
 
 - Obsidian 1.8.0+
-- API key for OpenAI or Google Gemini
+- API key for OpenAI, Google Gemini, or OpenRouter
+
+For OpenRouter, use OpenRouter model IDs such as `google/gemini-3.5-flash`.
 
 ## License
 
