@@ -11,6 +11,7 @@ const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
 const DIRECT_GEMINI_UPLOAD_MAX_BYTES = 20 * 1024 * 1024;
 const GEMINI_JSON_MAX_OUTPUT_TOKENS = 65536;
 const GEMINI_FULL_AUDIO_TRANSCRIPTION_MAX_SECONDS = 5 * 60;
+const GEMINI_DIARIZATION_CHUNK_SECONDS = 5 * 60;
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 type TranscriptionStage = 'preprocess' | 'upload' | 'processing' | 'transcribe' | 'done';
@@ -78,6 +79,7 @@ interface GeminiGenerateContentResponse {
 	usageMetadata?: {
 		promptTokenCount?: number;
 		candidatesTokenCount?: number;
+		thoughtsTokenCount?: number;
 		totalTokenCount?: number;
 	};
 }
@@ -213,7 +215,7 @@ export class TranscriberService {
 				});
 
 				this.emitProgress(options, { provider: 'gemini', stage: 'preprocess' });
-				const chunks = await this.preprocessForGeminiWithOffsets(blob, 15 * 60, options);
+				const chunks = await this.preprocessForGeminiWithOffsets(blob, GEMINI_DIARIZATION_CHUNK_SECONDS, options);
 			if (!chunks.length) {
 				return { ...discovery, segments: [] };
 			}
@@ -385,11 +387,7 @@ export class TranscriberService {
 								},
 							],
 							config: {
-								temperature: 0,
-								maxOutputTokens: GEMINI_JSON_MAX_OUTPUT_TOKENS,
-								responseMimeType: 'application/json',
-								responseSchema: this.getSpeakerDiscoverySchema(Type),
-								abortSignal: options.signal,
+								...this.getGeminiJsonGenerationConfig(settings.model, this.getSpeakerDiscoverySchema(Type), options.signal),
 							},
 						}),
 					);
@@ -441,11 +439,7 @@ export class TranscriberService {
 							},
 						],
 						config: {
-							temperature: 0,
-							maxOutputTokens: GEMINI_JSON_MAX_OUTPUT_TOKENS,
-							responseMimeType: 'application/json',
-							responseSchema: this.getShortDiarizedTranscriptSchema(Type),
-							abortSignal: options.signal,
+							...this.getGeminiJsonGenerationConfig(settings.model, this.getShortDiarizedTranscriptSchema(Type), options.signal),
 						},
 					}),
 				);
@@ -517,11 +511,7 @@ export class TranscriberService {
 								},
 							],
 							config: {
-								temperature: 0,
-								maxOutputTokens: GEMINI_JSON_MAX_OUTPUT_TOKENS,
-								responseMimeType: 'application/json',
-								responseSchema: this.getChunkTranscriptSchema(Type),
-								abortSignal: options.signal,
+								...this.getGeminiJsonGenerationConfig(settings.model, this.getChunkTranscriptSchema(Type), options.signal),
 							},
 						}),
 					);
@@ -536,6 +526,32 @@ export class TranscriberService {
 			if (!Array.isArray(parsed.segments)) return [];
 			return this.normalizeGeminiTranscriptSegments(parsed.segments, chunk.startSec);
 		}
+
+	private getGeminiJsonGenerationConfig(
+		model: string,
+		responseSchema: unknown,
+		signal?: AbortSignal,
+	): Record<string, unknown> {
+		const config: Record<string, unknown> = {
+			temperature: 0,
+			maxOutputTokens: GEMINI_JSON_MAX_OUTPUT_TOKENS,
+			responseMimeType: 'application/json',
+			responseSchema,
+			abortSignal: signal,
+		};
+		const thinkingConfig = this.getGeminiJsonThinkingConfig(model);
+		if (thinkingConfig) {
+			config.thinkingConfig = thinkingConfig;
+		}
+		return config;
+	}
+
+	private getGeminiJsonThinkingConfig(model: string): Record<string, unknown> | undefined {
+		if (/^gemini-3(?:[.-]|$)/i.test(model.trim())) {
+			return { thinkingLevel: 'minimal' };
+		}
+		return undefined;
+	}
 
 	private getSpeakerDiscoverySchema(Type: Record<string, string>): unknown {
 		return {
@@ -658,6 +674,7 @@ export class TranscriberService {
 			const tokenParts = [
 				usage.promptTokenCount !== undefined ? `prompt=${usage.promptTokenCount}` : '',
 				usage.candidatesTokenCount !== undefined ? `candidates=${usage.candidatesTokenCount}` : '',
+				usage.thoughtsTokenCount !== undefined ? `thoughts=${usage.thoughtsTokenCount}` : '',
 				usage.totalTokenCount !== undefined ? `total=${usage.totalTokenCount}` : '',
 			].filter(Boolean);
 			if (tokenParts.length) {

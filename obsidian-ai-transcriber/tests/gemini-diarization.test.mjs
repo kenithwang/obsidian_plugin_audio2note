@@ -74,6 +74,100 @@ test('Gemini speaker discovery retries malformed JSON before failing the transcr
   }
 });
 
+test('Gemini 3.5 structured JSON calls use minimal thinking', async () => {
+  const { TranscriberService } = await loadTranscriberService();
+  const service = new TranscriberService();
+  const originalInfo = console.info;
+  console.info = () => {};
+  let firstGenerateParams;
+  try {
+    const genAI = {
+      models: {
+        async generateContent(params) {
+          firstGenerateParams ??= params;
+          return {
+            text: JSON.stringify({
+              speakers: [{ id: 'SPEAKER_00', voiceDescription: 'host' }],
+              timeline: [{ speakerId: 'SPEAKER_00', start: '00:00', end: '00:10' }],
+            }),
+            candidates: [{ finishReason: 'STOP' }],
+          };
+        },
+      },
+    };
+
+    await service.discoverGeminiSpeakers(
+      genAI,
+      { uri: 'file://audio' },
+      'audio/webm',
+      { provider: 'gemini', apiKey: 'test-key', model: 'gemini-3.5-flash' },
+      { OBJECT: 'object', ARRAY: 'array', STRING: 'string' },
+      {},
+    );
+
+    assert.deepEqual(firstGenerateParams.config.thinkingConfig, { thinkingLevel: 'minimal' });
+  } finally {
+    console.info = originalInfo;
+  }
+});
+
+test('Gemini JSON diagnostics include thinking token usage', async () => {
+  const { TranscriberService } = await loadTranscriberService();
+  const service = new TranscriberService();
+
+  assert.throws(
+    () => service.parseJsonResponse(
+      '{"segments":[{"speakerId":"SPEAKER_00","start":"00:00","end":"00:01","text":"unfinished',
+      'Gemini chunk transcription',
+      {
+        candidates: [{ finishReason: 'MAX_TOKENS' }],
+        usageMetadata: {
+          promptTokenCount: 27749,
+          candidatesTokenCount: 2606,
+          thoughtsTokenCount: 62915,
+          totalTokenCount: 93270,
+        },
+      },
+    ),
+    error => {
+      assert.match(error.message, /finishReason=MAX_TOKENS/);
+      assert.match(error.message, /tokens:prompt=27749,candidates=2606,thoughts=62915,total=93270/);
+      return true;
+    },
+  );
+});
+
+test('Gemini diarization chunks long recordings into five-minute ranges', async () => {
+  const { TranscriberService } = await loadTranscriberService();
+  const service = new TranscriberService();
+  const originalInfo = console.info;
+  console.info = () => {};
+  let observedMaxDurationSeconds;
+  try {
+    service.uploadGeminiFile = async () => ({ name: 'files/full', uri: 'file://audio' });
+    service.waitForGeminiFileReady = async (_genAI, file) => file;
+    service.discoverGeminiSpeakers = async () => ({
+      speakers: [{ id: 'SPEAKER_00', voiceDescription: 'host', candidateName: null }],
+      timeline: [{ speakerId: 'SPEAKER_00', startSec: 0, endSec: 900, confidence: 'high' }],
+    });
+    service.preprocessForGeminiWithOffsets = async (_blob, maxDurationSeconds) => {
+      observedMaxDurationSeconds = maxDurationSeconds;
+      return [];
+    };
+    service.deleteGeminiFile = async () => {};
+
+    await service.transcribeWithGeminiDiarization(
+      new Blob(['audio'], { type: 'audio/webm' }),
+      { provider: 'gemini', apiKey: 'test-key', model: 'gemini-3.5-flash' },
+      { durationSec: 900 },
+    );
+
+    assert.equal(observedMaxDurationSeconds, 5 * 60);
+  } finally {
+    console.info = originalInfo;
+  }
+});
+
 test('Gemini diarization can reuse the full uploaded audio for short recordings', async () => {
   const { TranscriberService } = await loadTranscriberService();
   const service = new TranscriberService();
