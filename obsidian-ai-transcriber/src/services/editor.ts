@@ -1,5 +1,7 @@
+import { requestUrl } from 'obsidian';
 import OpenAI from 'openai';
 import { EditorSettings } from '../settings/types';
+import { createObsidianFetch } from './obsidianFetch';
 
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
@@ -72,6 +74,7 @@ ${context.trim()}
 			apiKey,
 			...(baseURL ? { baseURL } : {}),
 			dangerouslyAllowBrowser: true,
+			fetch: createObsidianFetch(requestUrl),
 		});
 		this.openAIClients.set(cacheKey, client);
 		return client;

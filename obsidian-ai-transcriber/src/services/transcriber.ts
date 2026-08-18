@@ -1,5 +1,7 @@
+import { requestUrl } from 'obsidian';
 import OpenAI from 'openai';
 import { ApiProvider, TranscriberSettings } from '../settings/types';
+import { createObsidianFetch } from './obsidianFetch';
 
 const TARGET_SAMPLE_RATE = 16000;
 const SILENCE_THRESHOLD = 0.01;
@@ -12,6 +14,8 @@ const DIRECT_GEMINI_UPLOAD_MAX_BYTES = 20 * 1024 * 1024;
 const GEMINI_JSON_MAX_OUTPUT_TOKENS = 65536;
 const GEMINI_FULL_AUDIO_TRANSCRIPTION_MAX_SECONDS = 5 * 60;
 const GEMINI_DIARIZATION_CHUNK_SECONDS = 5 * 60;
+const GEMINI_DIARIZATION_OVERFLOW_MIN_CHUNK_SECONDS = 20;
+const GEMINI_DIARIZATION_OVERFLOW_MAX_DEPTH = 6;
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 type TranscriptionStage = 'preprocess' | 'upload' | 'processing' | 'transcribe' | 'done';
@@ -99,6 +103,9 @@ interface RetryOptions {
 	label: string;
 	signal?: AbortSignal;
 	maxRetries?: number;
+	shouldRetry?: (error: unknown, attempt: number) => boolean;
+	getRetryDelayMs?: (error: unknown, attempt: number) => number;
+	getRetryLogDetails?: (error: unknown) => Record<string, unknown>;
 }
 
 export class TranscriberService {
@@ -223,63 +230,36 @@ export class TranscriberService {
 			let completedChunks = 0;
 			const chunkSegments = await this.mapWithConcurrency(
 				chunks,
-				2,
+				1,
 				options.signal,
 				async (chunk, index, workerSignal) => {
 					const chunkIndex = index + 1;
-					const chunkMimeType = chunk.blob.type || 'audio/wav';
-					let uploadedChunk: GeminiUploadedFile | null = null;
-					try {
-						this.emitProgress(options, {
-							provider: 'gemini',
-							stage: 'upload',
-							currentChunk: chunkIndex,
-							totalChunks: chunks.length,
-							completedChunks,
-						});
-						uploadedChunk = await this.uploadGeminiFile(
-							genAI,
-							chunk.blob,
-							chunkMimeType,
-							`chunk ${chunkIndex}/${chunks.length}`,
-							workerSignal,
-						);
-						uploadedChunk = await this.waitForGeminiFileReady(genAI, uploadedChunk, chunkIndex, chunks.length, {
-							...options,
-							signal: workerSignal,
-						});
-
-						this.emitProgress(options, {
-							provider: 'gemini',
-							stage: 'transcribe',
-							currentChunk: chunkIndex,
-							totalChunks: chunks.length,
-							completedChunks,
-						});
-						const segments = await this.transcribeGeminiChunk(
-							genAI,
-							uploadedChunk,
-							chunkMimeType,
-							chunk,
-							discovery,
-							settings,
-							Type,
-							{ ...options, signal: workerSignal },
-						);
-						completedChunks++;
-						this.emitProgress(options, {
-							provider: 'gemini',
-							stage: 'transcribe',
-							currentChunk: chunkIndex,
-							totalChunks: chunks.length,
-							completedChunks,
-						});
-						return segments;
-						} finally {
-							if (uploadedChunk?.name) {
-								await this.deleteGeminiFile(genAI, uploadedChunk);
-							}
-						}
+					this.emitProgress(options, {
+						provider: 'gemini',
+						stage: 'upload',
+						currentChunk: chunkIndex,
+						totalChunks: chunks.length,
+						completedChunks,
+					});
+					const segments = await this.transcribeGeminiChunkAdaptive(
+						genAI,
+						chunk,
+						chunkIndex,
+						chunks.length,
+						discovery,
+						settings,
+						Type,
+						{ ...options, signal: workerSignal },
+					);
+					completedChunks++;
+					this.emitProgress(options, {
+						provider: 'gemini',
+						stage: 'transcribe',
+						currentChunk: chunkIndex,
+						totalChunks: chunks.length,
+						completedChunks,
+					});
+					return segments;
 				},
 			);
 
@@ -314,27 +294,64 @@ export class TranscriberService {
 		label: string,
 		signal?: AbortSignal,
 	): Promise<GeminiUploadedFile> {
-		const uploadedFile = await this.withTiming(
-			'Gemini upload',
-			{ label, mimeType, sizeBytes: blob.size },
-			() => this.withRetries(
-				async () => {
-					this.throwIfAborted(signal);
-					return await genAI.files.upload({
-						file: blob,
-						config: {
+		const maxAttempts = 3;
+		let uploadedFile: GeminiUploadedFile;
+		try {
+			uploadedFile = await this.withTiming(
+				'Gemini upload',
+				{ label, mimeType, sizeBytes: blob.size },
+				() => this.withRetries(
+					async () => {
+						this.throwIfAborted(signal);
+						return await genAI.files.upload({
+							file: blob,
+							config: {
+								mimeType,
+								abortSignal: signal,
+							},
+						});
+					},
+					{
+						label: `Gemini upload ${label}`,
+						signal,
+						maxRetries: maxAttempts,
+						getRetryDelayMs: (error, attempt) => this.getGeminiUploadRetryDelayMs(error, attempt),
+						getRetryLogDetails: error => ({
+							uploadLabel: label,
 							mimeType,
-							abortSignal: signal,
-						},
-					});
-				},
-				{ label: `Gemini upload ${label}`, signal },
-			),
-		);
+							sizeBytes: blob.size,
+							classification: this.isGeminiUploadFinalizationError(error) ? 'upload_finalization' : 'other',
+						}),
+					},
+				),
+			);
+		} catch (error) {
+			if (this.isAbortError(error)) {
+				throw error;
+			}
+			const classification = this.isGeminiUploadFinalizationError(error) ? 'upload_finalization' : 'other';
+			throw new Error(
+				`Gemini upload ${label} failed (mimeType=${mimeType}, sizeBytes=${blob.size}, attempts=${maxAttempts}, classification=${classification}): ${
+					(error as Error)?.message ?? 'Unknown error'
+				}`,
+			);
+		}
 		if (!uploadedFile?.name || !uploadedFile?.uri) {
 			throw new Error(`Gemini File API upload failed for ${label}: no file URI returned`);
 		}
 		return uploadedFile;
+	}
+
+	private isGeminiUploadFinalizationError(error: unknown): boolean {
+		return /(?:Upload status is not finalized|upload status is not finalized)/i
+			.test((error as Error)?.message ?? '');
+	}
+
+	private getGeminiUploadRetryDelayMs(error: unknown, attempt: number): number {
+		if (!this.isGeminiUploadFinalizationError(error)) {
+			return 500 * Math.pow(2, attempt - 1);
+		}
+		return 2000 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 501);
 	}
 
 	private async deleteGeminiFile(
@@ -443,7 +460,7 @@ export class TranscriberService {
 						},
 					}),
 				);
-				return this.parseJsonResponse(response.text, 'Gemini short diarization', response);
+				return this.parseJsonResponse(response.text, 'Gemini short diarization', response, { salvageSegmentsOnTruncation: true });
 			},
 			{
 				label: 'Gemini short diarization',
@@ -462,6 +479,211 @@ export class TranscriberService {
 			throw new Error('Gemini short diarization returned no usable transcript segments.');
 		}
 		return { speakers, timeline, segments };
+	}
+
+	private async transcribeGeminiChunkAdaptive(
+		genAI: {
+			models: { generateContent: (params: unknown) => Promise<GeminiGenerateContentResponse> };
+			files?: {
+				upload: (params: { file: Blob; config: { mimeType: string; abortSignal?: AbortSignal } }) => Promise<GeminiUploadedFile>;
+				get: (params: { name: string; config?: { abortSignal?: AbortSignal } }) => Promise<GeminiUploadedFile>;
+				delete: (params: { name: string; config?: { abortSignal?: AbortSignal } }) => Promise<unknown>;
+			};
+		},
+		chunk: TimedAudioChunk,
+		chunkIndex: number,
+		totalChunks: number,
+		discovery: { speakers: DiscoveredSpeaker[]; timeline: SpeakerTimelineSegment[] },
+		settings: TranscriberSettings,
+		Type: Record<string, string>,
+		options: TranscribeOptions,
+		depth = 0,
+		label = `chunk ${chunkIndex}/${totalChunks}`,
+	): Promise<DiarizedTranscriptSegment[]> {
+		const chunkMimeType = chunk.blob.type || 'audio/wav';
+		let uploadedChunk: GeminiUploadedFile | null = null;
+		try {
+			uploadedChunk = await this.uploadGeminiFile(
+				genAI as Parameters<TranscriberService['uploadGeminiFile']>[0],
+				chunk.blob,
+				chunkMimeType,
+				label,
+				options.signal,
+			);
+			uploadedChunk = await this.waitForGeminiFileReady(
+				genAI as Parameters<TranscriberService['waitForGeminiFileReady']>[0],
+				uploadedChunk,
+				chunkIndex,
+				totalChunks,
+				options,
+			);
+
+			this.emitProgress(options, {
+				provider: 'gemini',
+				stage: 'transcribe',
+				currentChunk: chunkIndex,
+				totalChunks,
+			});
+			return await this.transcribeGeminiChunk(
+				genAI,
+				uploadedChunk,
+				chunkMimeType,
+				chunk,
+				discovery,
+				settings,
+				Type,
+				options,
+			);
+		} catch (error) {
+			if (!this.isGeminiMaxTokensError(error) || depth >= GEMINI_DIARIZATION_OVERFLOW_MAX_DEPTH) {
+				throw error;
+			}
+			const childChunks = await this.splitTimedWavChunkForGeminiOverflow(chunk, options.signal);
+			if (childChunks.length <= 1) {
+				throw error;
+			}
+			console.warn('[AI Transcriber] Gemini chunk transcription hit output token limit; retrying with smaller chunks.', {
+				label,
+				startSec: chunk.startSec,
+				endSec: chunk.endSec,
+				childRanges: childChunks.map(child => [child.startSec, child.endSec]),
+			});
+			const childSegments: DiarizedTranscriptSegment[][] = [];
+			for (let i = 0; i < childChunks.length; i++) {
+				this.throwIfAborted(options.signal);
+				childSegments.push(await this.transcribeGeminiChunkAdaptive(
+					genAI,
+					childChunks[i],
+					chunkIndex,
+					totalChunks,
+					discovery,
+					settings,
+					Type,
+					options,
+					depth + 1,
+					`${label} split ${i + 1}/${childChunks.length}`,
+				));
+			}
+			return childSegments.flat().sort((a, b) => a.startSec - b.startSec);
+		} finally {
+			if (uploadedChunk?.name) {
+				await this.deleteGeminiFile(
+					genAI as Parameters<TranscriberService['deleteGeminiFile']>[0],
+					uploadedChunk,
+				);
+			}
+		}
+	}
+
+	private async splitTimedWavChunkForGeminiOverflow(
+		chunk: TimedAudioChunk,
+		signal?: AbortSignal,
+	): Promise<TimedAudioChunk[]> {
+		this.throwIfAborted(signal);
+		const durationSec = Math.max(0, chunk.endSec - chunk.startSec);
+		if (durationSec <= GEMINI_DIARIZATION_OVERFLOW_MIN_CHUNK_SECONDS) {
+			return [chunk];
+		}
+
+		const wavData = await this.readMonoPcm16Wav(chunk.blob);
+		if (!wavData || wavData.samples.length < 2) {
+			return [chunk];
+		}
+
+		const minSamples = Math.floor(GEMINI_DIARIZATION_OVERFLOW_MIN_CHUNK_SECONDS * wavData.sampleRate);
+		if (wavData.samples.length < minSamples * 2) {
+			return [chunk];
+		}
+
+		const desiredSplit = Math.floor(wavData.samples.length / 2);
+		const silenceWindowSamples = Math.floor(SILENCE_WINDOW_SECONDS * wavData.sampleRate);
+		const searchRangeSamples = Math.floor(SEARCH_RANGE_SECONDS * wavData.sampleRate);
+		const silenceSplit = this.findSilenceSplitPoint(
+			wavData.samples,
+			desiredSplit,
+			wavData.samples.length,
+			silenceWindowSamples,
+			searchRangeSamples,
+			SILENCE_THRESHOLD,
+		);
+		const splitSample = silenceSplit !== null
+			&& silenceSplit >= minSamples
+			&& wavData.samples.length - silenceSplit >= minSamples
+			? silenceSplit
+			: desiredSplit;
+		if (splitSample <= 0 || splitSample >= wavData.samples.length) {
+			return [chunk];
+		}
+
+		const ranges: Array<[number, number]> = [[0, splitSample], [splitSample, wavData.samples.length]];
+		return ranges.map(([startSample, endSample], index) => {
+			const isLast = index === ranges.length - 1;
+			return {
+				blob: new Blob(
+					[this.float32ToWavBuffer(wavData.samples.subarray(startSample, endSample), wavData.sampleRate)],
+					{ type: 'audio/wav' },
+				),
+				startSec: chunk.startSec + startSample / wavData.sampleRate,
+				endSec: isLast ? chunk.endSec : chunk.startSec + endSample / wavData.sampleRate,
+			};
+		});
+	}
+
+	private async readMonoPcm16Wav(blob: Blob): Promise<{ samples: Float32Array; sampleRate: number } | null> {
+		const buffer = await blob.arrayBuffer();
+		if (buffer.byteLength < 44) return null;
+		const view = new DataView(buffer);
+		if (this.readAscii(view, 0, 4) !== 'RIFF' || this.readAscii(view, 8, 4) !== 'WAVE') {
+			return null;
+		}
+
+		let offset = 12;
+		let sampleRate = 0;
+		let channels = 0;
+		let bitsPerSample = 0;
+		let audioFormat = 0;
+		let dataOffset = -1;
+		let dataSize = 0;
+		while (offset + 8 <= view.byteLength) {
+			const chunkId = this.readAscii(view, offset, 4);
+			const chunkSize = view.getUint32(offset + 4, true);
+			const payloadOffset = offset + 8;
+			if (payloadOffset + chunkSize > view.byteLength) break;
+			if (chunkId === 'fmt ') {
+				audioFormat = view.getUint16(payloadOffset, true);
+				channels = view.getUint16(payloadOffset + 2, true);
+				sampleRate = view.getUint32(payloadOffset + 4, true);
+				bitsPerSample = view.getUint16(payloadOffset + 14, true);
+			} else if (chunkId === 'data') {
+				dataOffset = payloadOffset;
+				dataSize = chunkSize;
+			}
+			offset = payloadOffset + chunkSize + (chunkSize % 2);
+		}
+
+		if (audioFormat !== 1 || channels !== 1 || bitsPerSample !== 16 || sampleRate <= 0 || dataOffset < 0 || dataSize <= 0) {
+			return null;
+		}
+
+		const sampleCount = Math.floor(dataSize / 2);
+		const samples = new Float32Array(sampleCount);
+		for (let i = 0; i < sampleCount; i++) {
+			const value = view.getInt16(dataOffset + i * 2, true);
+			samples[i] = value < 0 ? value / 0x8000 : value / 0x7fff;
+		}
+		return { samples, sampleRate };
+	}
+
+	private readAscii(view: DataView, offset: number, length: number): string {
+		let value = '';
+		for (let i = 0; i < length; i++) {
+			value += String.fromCharCode(view.getUint8(offset + i));
+		}
+		return value;
+	}
+
+	private isGeminiMaxTokensError(error: unknown): boolean {
+		return /\bfinishReason=MAX_TOKENS\b/.test((error as Error)?.message ?? '');
 	}
 
 		private async transcribeGeminiChunk(
@@ -515,12 +737,13 @@ export class TranscriberService {
 							},
 						}),
 					);
-					return this.parseJsonResponse(response.text, 'Gemini chunk transcription', response);
+					return this.parseJsonResponse(response.text, 'Gemini chunk transcription', response, { salvageSegmentsOnTruncation: true });
 				},
 			{
 				label: `Gemini chunk transcription ${this.formatHms(chunk.startSec)}-${this.formatHms(chunk.endSec)}`,
 				signal: options.signal,
 				maxRetries: 3,
+				shouldRetry: error => !this.isGeminiMaxTokensError(error),
 			},
 			);
 			if (!Array.isArray(parsed.segments)) return [];
@@ -547,8 +770,14 @@ export class TranscriberService {
 	}
 
 	private getGeminiJsonThinkingConfig(model: string): Record<string, unknown> | undefined {
-		if (/^gemini-3(?:[.-]|$)/i.test(model.trim())) {
+		const normalized = model.trim();
+		if (/^gemini-3(?:[.-]|$)/i.test(normalized)) {
 			return { thinkingLevel: 'minimal' };
+		}
+		if (/^gemini-2\.5(?:[.-]|$)/i.test(normalized)) {
+			// Thinking tokens count against maxOutputTokens on Gemini 2.5;
+			// cap them so transcription output is not starved.
+			return { thinkingBudget: 1024 };
 		}
 		return undefined;
 	}
@@ -643,9 +872,17 @@ export class TranscriberService {
 		};
 	}
 
-	private parseJsonResponse(text: unknown, label: string, response?: GeminiGenerateContentResponse): any {
+	private parseJsonResponse(
+		text: unknown,
+		label: string,
+		response?: GeminiGenerateContentResponse,
+		options?: { salvageSegmentsOnTruncation?: boolean },
+	): any {
 		if (typeof text !== 'string' || !text.trim()) {
-			throw new Error(`${label} returned no text content.`);
+			const emptyDiagnostics = this.formatGeminiJsonDiagnostics(response, '');
+			throw new Error(
+				`${label} returned no text content.${emptyDiagnostics ? ` (${emptyDiagnostics})` : ''}`,
+			);
 		}
 		const trimmed = text.trim()
 			.replace(/^```(?:json)?\s*/i, '')
@@ -653,6 +890,16 @@ export class TranscriberService {
 		try {
 			return JSON.parse(trimmed);
 		} catch (error) {
+			if (options?.salvageSegmentsOnTruncation) {
+				const salvaged = this.salvageTruncatedSegmentsJson(trimmed);
+				if (salvaged) {
+					console.warn(
+						`[AI Transcriber] ${label} returned truncated JSON; salvaged ${salvaged.segments.length} complete segments.`,
+						{ label, diagnostics: this.formatGeminiJsonDiagnostics(response, trimmed) },
+					);
+					return salvaged;
+				}
+			}
 			const diagnostics = this.formatGeminiJsonDiagnostics(response, trimmed);
 			throw new Error(
 				`${label} returned invalid JSON: ${(error as Error).message}${diagnostics ? ` (${diagnostics})` : ''}`,
@@ -660,8 +907,59 @@ export class TranscriberService {
 		}
 	}
 
+	private salvageTruncatedSegmentsJson(text: string): { segments: unknown[] } | null {
+		const keyIndex = text.indexOf('"segments"');
+		if (keyIndex < 0) return null;
+		const arrayStart = text.indexOf('[', keyIndex);
+		if (arrayStart < 0) return null;
+		const objects: string[] = [];
+		let depth = 0;
+		let inString = false;
+		let escaped = false;
+		let objectStart = -1;
+		for (let i = arrayStart + 1; i < text.length; i++) {
+			const ch = text[i];
+			if (inString) {
+				if (escaped) {
+					escaped = false;
+				} else if (ch === '\\') {
+					escaped = true;
+				} else if (ch === '"') {
+					inString = false;
+				}
+				continue;
+			}
+			if (ch === '"') {
+				inString = true;
+			} else if (ch === '{') {
+				if (depth === 0) objectStart = i;
+				depth++;
+			} else if (ch === '}') {
+				depth--;
+				if (depth === 0 && objectStart >= 0) {
+					objects.push(text.slice(objectStart, i + 1));
+					objectStart = -1;
+				}
+			} else if (ch === ']' && depth === 0) {
+				break;
+			}
+		}
+		if (!objects.length) return null;
+		try {
+			return JSON.parse(`{"segments":[${objects.join(',')}]}`);
+		} catch {
+			return null;
+		}
+	}
+
 	private formatGeminiJsonDiagnostics(response: GeminiGenerateContentResponse | undefined, text: string): string {
 		const parts: string[] = [`responseLength=${text.length}`];
+		if (text.length) {
+			parts.push(`head=${JSON.stringify(text.slice(0, 400))}`);
+			if (text.length > 400) {
+				parts.push(`tail=${JSON.stringify(text.slice(-200))}`);
+			}
+		}
 		const firstCandidate = response?.candidates?.[0];
 		if (firstCandidate?.finishReason) {
 			parts.push(`finishReason=${firstCandidate.finishReason}`);
@@ -920,26 +1218,40 @@ export class TranscriberService {
 	private async withRetries<T>(operation: () => Promise<T>, options: RetryOptions): Promise<T> {
 		const maxRetries = options.maxRetries ?? 3;
 		let lastError: unknown;
+		let attemptsMade = 0;
 
 		for (let attempt = 1; attempt <= maxRetries; attempt++) {
 			this.throwIfAborted(options.signal);
 			try {
+				attemptsMade = attempt;
 				return await operation();
 			} catch (error) {
 				lastError = error;
 				if (this.isAbortError(error)) {
 					throw error;
 				}
-				if (attempt >= maxRetries) {
+				if (attempt >= maxRetries || options.shouldRetry?.(error, attempt) === false) {
 					break;
 				}
-				console.warn(`[AI Transcriber] ${options.label} failed (attempt ${attempt}/${maxRetries}). Retrying...`, error);
-				await this.sleep(500 * Math.pow(2, attempt - 1), options.signal);
+					const delayMs = options.getRetryDelayMs?.(error, attempt)
+						?? 500 * Math.pow(2, attempt - 1);
+					console.warn(
+						`[AI Transcriber] ${options.label} failed (attempt ${attempt}/${maxRetries}). Retrying...`,
+						{
+							label: options.label,
+							attempt,
+							maxAttempts: maxRetries,
+							delayMs,
+							...options.getRetryLogDetails?.(error),
+						},
+						error,
+					);
+					await this.sleep(delayMs, options.signal);
 			}
 		}
 
 		throw new Error(
-			`[AI Transcriber] ${options.label} failed after ${maxRetries} attempts: ${
+			`[AI Transcriber] ${options.label} failed after ${attemptsMade} attempt${attemptsMade === 1 ? '' : 's'}: ${
 				(lastError as Error)?.message ?? 'Unknown error'
 			}`,
 		);
@@ -1055,6 +1367,7 @@ export class TranscriberService {
 			apiKey,
 			...(baseURL ? { baseURL } : {}),
 			dangerouslyAllowBrowser: true,
+			fetch: createObsidianFetch(requestUrl),
 		});
 		this.openAIClients.set(cacheKey, client);
 		return client;

@@ -15,3 +15,10 @@ test('OpenRouter is exposed as a first-class provider in settings and services',
   assert.match(editor, /settings\.provider === 'openrouter'/);
   assert.match(editor, /OPENROUTER_BASE_URL/);
 });
+
+test('OpenAI-compatible clients send requests through Obsidian requestUrl', () => {
+  assert.match(transcriber, /createObsidianFetch/);
+  assert.match(transcriber, /fetch:\s*createObsidianFetch\(requestUrl\)/);
+  assert.match(editor, /createObsidianFetch/);
+  assert.match(editor, /fetch:\s*createObsidianFetch\(requestUrl\)/);
+});
