@@ -26,10 +26,10 @@ export function createObsidianFetch(request: RequestUrlFn): typeof fetch {
 
 		throwIfAborted(signal);
 
-		const headers = {
+		const headers = sanitizeRequestHeaders({
 			...headersToRecord(source?.headers),
 			...headersToRecord(init?.headers),
-		};
+		});
 
 		const rawBody = init?.body !== undefined
 			? init.body
@@ -79,6 +79,32 @@ function createAbortError(): Error {
 		err.name = 'AbortError';
 		return err;
 	}
+}
+
+const UNSAFE_REQUEST_HEADERS = new Set([
+	'content-length',
+	'host',
+	'connection',
+	'transfer-encoding',
+	'keep-alive',
+	'trailer',
+	'te',
+	'upgrade',
+	'expect',
+]);
+
+function sanitizeRequestHeaders(headers: Record<string, string>): Record<string, string> {
+	const result: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		if (!value) {
+			continue;
+		}
+		if (UNSAFE_REQUEST_HEADERS.has(key.toLowerCase())) {
+			continue;
+		}
+		result[key] = value;
+	}
+	return result;
 }
 
 function headersToRecord(headers?: HeadersInit): Record<string, string> {

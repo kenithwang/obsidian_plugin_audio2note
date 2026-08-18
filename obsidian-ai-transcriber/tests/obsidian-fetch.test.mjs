@@ -117,6 +117,45 @@ test('FormData is encoded as multipart for requestUrl', async () => {
   assert.match(encoded, /\x01\x02\x03\x04/);
 });
 
+test('unsafe Electron headers such as content-length are not forwarded to requestUrl', async () => {
+  const { createObsidianFetch } = await loadObsidianFetch();
+  const calls = [];
+  const fetchImpl = createObsidianFetch(async (params) => {
+    calls.push(params);
+    return {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      arrayBuffer: textBuffer('{"ok":true}'),
+      text: '{"ok":true}',
+      json: { ok: true },
+    };
+  });
+
+  await fetchImpl('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer test-key',
+      'Content-Type': 'application/json',
+      'content-length': '1234',
+      'Content-Length': '1234',
+      Host: 'openrouter.ai',
+      Connection: 'keep-alive',
+      'User-Agent': 'OpenAI/JS 4.97.0',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ model: 'google/gemini-3.5-flash' }),
+  });
+
+  assert.equal(calls.length, 1);
+  const headerNames = Object.keys(calls[0].headers).map((name) => name.toLowerCase());
+  assert.equal(headerNames.includes('content-length'), false);
+  assert.equal(headerNames.includes('host'), false);
+  assert.equal(headerNames.includes('connection'), false);
+  assert.equal(calls[0].headers.Authorization, 'Bearer test-key');
+  assert.equal(calls[0].headers.Accept, 'application/json');
+  assert.match(calls[0].headers['Content-Type'] || calls[0].headers['content-type'], /application\/json/);
+});
+
 test('an already-aborted signal fails before requestUrl is called', async () => {
   const { createObsidianFetch } = await loadObsidianFetch();
   let called = false;
