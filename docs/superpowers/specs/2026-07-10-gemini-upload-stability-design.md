@@ -74,11 +74,11 @@ The full test suite, TypeScript check, and production build must pass. The gener
 
 ## Deployment and verification
 
-After implementation verification, deploy `main.js`, `manifest.json`, and `styles.css` to the actual plugin directory:
+After implementation verification, publish `main.js`, `manifest.json`, and `styles.css` to the synced transfer folder:
 
-`Obsidian Vault:应用/remotely-save/Obsidian Vault/.obsidian/plugins/obsidian-ai-transcriber/`
+`Obsidian Vault:应用/remotely-save/Obsidian Vault/AI Transcribe/Transcript/`
 
-Verify the remote SHA-256 hashes against the local artifacts. The legacy path documented in `address.md` is not the active Obsidian plugin directory and will not be used for this deployment.
+Verify the remote SHA-256 hashes against the local artifacts. Do not upload directly to the remote `.obsidian/plugins/obsidian-ai-transcriber/` directory because local sync excludes it; publication to `Transcript/` does not by itself prove that the active local plugin was replaced.
 
 Live Gemini API mutation is outside this patch's automated verification because it would upload user data or incur external API usage. Production evidence should be collected from the new structured logs during normal use.
 
