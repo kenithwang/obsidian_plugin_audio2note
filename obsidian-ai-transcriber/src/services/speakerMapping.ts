@@ -70,6 +70,44 @@ export function createDefaultSpeakerMapping(speakerIds: string[], participants: 
 	return mapping;
 }
 
+export function createCandidateNameSpeakerMapping(
+	speakers: Array<{ id: string; candidateName?: string | null }>,
+	participants: Participant[],
+): SpeakerMapping {
+	const mapping: SpeakerMapping = {};
+	const usedParticipantIds = new Set<string>();
+	for (const speaker of speakers) {
+		const candidateName = normalizeMappingText(speaker.candidateName || '');
+		if (!speaker.id || !candidateName) continue;
+		const participant = participants.find(item => {
+			if (usedParticipantIds.has(item.id)) return false;
+			const participantName = normalizeMappingText(item.name);
+			const participantOrg = normalizeMappingText(item.org);
+			if (!participantName) return false;
+			if (candidateName === participantName) return true;
+			if (!hasNormalizedPhrase(candidateName, participantName)) return false;
+			return !participantOrg || hasNormalizedPhrase(candidateName, participantOrg);
+		});
+		if (participant) {
+			mapping[speaker.id] = participant.id;
+			usedParticipantIds.add(participant.id);
+		}
+	}
+	return mapping;
+}
+
+function normalizeMappingText(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
+		.trim()
+		.replace(/\s+/g, ' ');
+}
+
+function hasNormalizedPhrase(text: string, phrase: string): boolean {
+	return ` ${text} `.includes(` ${phrase} `);
+}
+
 export function getParticipantDisplayName(participants: Participant[], participantId: string, fallback: string): string {
 	const participant = participants.find(item => item.id === participantId);
 	if (!participant) return fallback;

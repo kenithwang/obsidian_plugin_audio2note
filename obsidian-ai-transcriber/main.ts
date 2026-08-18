@@ -6,10 +6,12 @@ import SettingsTab from './src/settings/settingsTab';
 import { PluginSettings, DEFAULT_SETTINGS } from './src/settings/types';
 import { DiarizedTranscriptSegment, GeminiDiarizedTranscript, TranscriberService, TranscriptionProgress } from './src/services/transcriber';
 import { EditProgress, EditorService } from './src/services/editor';
-import { DiarizationSegment, SidecarService, SidecarStatus, SpeakerAnalysis } from './src/services/sidecar';
+import { SidecarService, SidecarStatus, SpeakerAnalysis } from './src/services/sidecar';
 import { SystemPromptTemplateSelectionModal } from './src/ui/SystemPromptTemplateSelectionModal';
 import { SPEAKER_MAPPING_VIEW_TYPE, SpeakerMappingView, SpeakerMappingViewState } from './src/ui/SpeakerMappingView';
 import {
+	applySpeakerMapping,
+	createCandidateNameSpeakerMapping,
 	createDefaultSpeakerMapping,
 	prepareSpeakerMappingSession,
 } from './src/services/speakerMapping';
@@ -542,46 +544,36 @@ export default class ObsidianAITranscriber extends Plugin {
 			return session.text;
 		}
 
-		await this.fileService.updateText(rawPath, session.text);
-		await this.fileService.openFile(rawPath);
-
-		return new Promise<string>((resolve, reject) => {
-			if (signal.aborted) {
-				reject(this.createAbortError());
-				return;
-			}
-			const onAbort = () => {
+		this.throwIfAborted(signal);
+		let suggestedMapping: Record<string, string> = {};
+		try {
+			suggestedMapping = analyses.length
+				? await this.voiceProfileService.suggestMapping(analyses, participants)
+				: {};
+		} catch (error) {
+			if (this.isAbortError(error)) throw error;
+			console.warn('[AI Transcriber] Automatic speaker mapping failed; continuing with generic speaker labels.', error);
+		}
+		this.throwIfAborted(signal);
+		const mapping = {
+			...createDefaultSpeakerMapping(session.speakerIds, []),
+			...suggestedMapping,
+		};
+		const mappedText = applySpeakerMapping(session.text, mapping, participants);
+		await this.fileService.updateText(rawPath, mappedText);
+		const viewState: SpeakerMappingViewState = {
+			rawPath,
+			speakerIds: session.speakerIds,
+			participants,
+			mapping,
+			onConfirm: text => {
 				this.latestSpeakerMappingSession = null;
-				reject(this.createAbortError());
-			};
-			signal.addEventListener('abort', onAbort, { once: true });
-			void this.voiceProfileService.suggestMapping(analyses, participants).then(suggestedMapping => {
-				if (signal.aborted) {
-					reject(this.createAbortError());
-					return;
-				}
-				const viewState: SpeakerMappingViewState = {
-					rawPath,
-					speakerIds: session.speakerIds,
-					participants,
-					mapping: {
-						...createDefaultSpeakerMapping(session.speakerIds, []),
-						...suggestedMapping,
-					},
-					onConfirm: text => {
-						signal.removeEventListener('abort', onAbort);
-						this.latestSpeakerMappingSession = null;
-						void this.voiceProfileService.learnFromConfirmedMapping(recordingId, analyses, viewState.mapping);
-						resolve(text);
-					},
-				};
-				this.latestSpeakerMappingSession = viewState;
-				void this.showSpeakerMappingPanel(viewState);
-			}).catch(error => {
-				signal.removeEventListener('abort', onAbort);
-				reject(error);
-			});
-		});
+				void this.voiceProfileService.learnFromConfirmedMapping(recordingId, analyses, viewState.mapping);
+				void this.fileService.updateText(rawPath, text);
+			},
+		};
+		this.latestSpeakerMappingSession = viewState;
+		return mappedText;
 	}
 
 	private async tryAnalyzeSpeakers(blob: Blob, baseName: string, signal: AbortSignal): Promise<SpeakerAnalysis[]> {
@@ -606,64 +598,14 @@ export default class ObsidianAITranscriber extends Plugin {
 		}
 	}
 
-	private getSegmentsFromAnalyses(analyses: SpeakerAnalysis[]): DiarizationSegment[] {
-		return analyses.flatMap(analysis => analysis.segments);
-	}
-
-	private buildDiarizationTimeline(segments: DiarizationSegment[]): string {
-		if (!segments.length) return '';
-		const lines = [
-			'### Speaker Timeline',
-			'',
-			...segments.map(segment => {
-				const start = formatTimestamp(segment.start);
-				const end = formatTimestamp(segment.end);
-				return `[${start} - ${end}] <!-- speaker:${segment.speaker} --> ${segment.speaker}:`;
-			}),
-		];
-		return lines.join('\n');
-	}
-
-	private combineDiarizationAndTranscript(segments: DiarizationSegment[], transcript: string): string {
-		const timeline = this.buildDiarizationTimeline(segments);
-		if (!timeline) return transcript;
-		return `${timeline}\n\n---\n\n### ASR Transcript\n\n${transcript.trim()}`;
-	}
-
-	private buildGeminiDiarizedTranscript(result: GeminiDiarizedTranscript): string {
-		const speakerLines = result.speakers.length
-				? [
-					'### Speakers',
-					'',
-					...result.speakers.map(speaker => {
-						const description = speaker.voiceDescription ? ` - ${speaker.voiceDescription}` : '';
-						const candidate = speaker.candidateName ? ` (candidate: ${speaker.candidateName})` : '';
-						const label = this.transcriber.getSpeakerDisplayLabel(speaker.id);
-						return `- ${label}${candidate}${description}`;
-					}),
-					'',
-				]
-			: [];
-		const timelineLines = result.timeline.length
-			? [
-				'### Speaker Timeline',
-				'',
-					...result.timeline.map(segment => {
-						const start = formatTimestamp(segment.startSec);
-						const end = formatTimestamp(segment.endSec);
-						const confidence = segment.confidence && segment.confidence !== 'high' ? ` confidence:${segment.confidence}` : '';
-						const label = this.transcriber.getSpeakerDisplayLabel(segment.speakerId);
-						return `[${start} - ${end}] <!-- speaker:${segment.speakerId}${confidence} --> ${label}:`;
-					}),
-					'',
-				]
-			: [];
+	private buildGeminiDiarizedTranscript(result: GeminiDiarizedTranscript, participants: Participant[] = []): string {
+		const mapping = createCandidateNameSpeakerMapping(result.speakers, participants);
 		const transcriptLines = [
 			'### Transcript',
 			'',
 			...result.segments.map(segment => this.formatDiarizedTranscriptSegment(segment)),
 		];
-		return [...speakerLines, ...timelineLines, ...transcriptLines].join('\n').trim();
+		return applySpeakerMapping(transcriptLines.join('\n').trim(), mapping, participants);
 	}
 
 	private formatDiarizedTranscriptSegment(segment: DiarizedTranscriptSegment): string {
@@ -733,10 +675,9 @@ export default class ObsidianAITranscriber extends Plugin {
 						this.updateProgressNotice(message);
 					},
 				});
-				transcript = this.buildGeminiDiarizedTranscript(diarized);
+				transcript = this.buildGeminiDiarizedTranscript(diarized, participants);
 			} else {
 				speakerAnalyses = await this.tryAnalyzeSpeakers(blob, baseName, signal);
-				const diarizationSegments = this.getSegmentsFromAnalyses(speakerAnalyses);
 				this.updateStatus(t('statusTranscribing'));
 				this.updateProgressNotice(t('noticeTranscribingAudio'));
 
@@ -749,7 +690,7 @@ export default class ObsidianAITranscriber extends Plugin {
 						this.updateProgressNotice(message);
 					},
 				});
-				transcript = this.combineDiarizationAndTranscript(diarizationSegments, transcript);
+				transcript = transcript.trim();
 			}
 
 			const dir = this.settings.transcriber.transcriptDir;

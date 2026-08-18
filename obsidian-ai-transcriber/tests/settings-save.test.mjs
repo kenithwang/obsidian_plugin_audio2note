@@ -33,3 +33,20 @@ test('Gemini diarization does not require preselected participants', () => {
 test('speaker confirmation is skipped when there are no candidate participants', () => {
   assert.match(main, /if \(!participants\.length\) {\s*await this\.fileService\.updateText\(rawPath, session\.text\);\s*return session\.text;\s*}/s);
 });
+
+test('speaker mapping is applied automatically without waiting for panel confirmation', () => {
+  assert.doesNotMatch(main, /return new Promise<string>/);
+  assert.doesNotMatch(main, /void this\.showSpeakerMappingPanel\(viewState\)/);
+  assert.match(main, /const mappedText = applySpeakerMapping\(session\.text, mapping, participants\)/);
+});
+
+test('Gemini diarized raw transcript contains transcript lines without speaker distribution sections', () => {
+  const buildStart = main.indexOf('private buildGeminiDiarizedTranscript(');
+  const buildEnd = main.indexOf('private formatDiarizedTranscriptSegment(', buildStart);
+  assert.notEqual(buildStart, -1);
+  assert.notEqual(buildEnd, -1);
+  const buildMethod = main.slice(buildStart, buildEnd);
+  assert.doesNotMatch(buildMethod, /### Speakers/);
+  assert.doesNotMatch(buildMethod, /### Speaker Timeline/);
+  assert.match(buildMethod, /const transcriptLines = \[\s*'### Transcript'/s);
+});
